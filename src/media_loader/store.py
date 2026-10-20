@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import shutil
 import time
 import uuid
@@ -21,6 +22,8 @@ SOURCE_ACTIVE_PREFIX = "ml:source:active:"
 SOURCE_PROGRESS_PREFIX = "ml:source:progress:"
 JOB_PREFIX = "ml:job:"
 JOB_PROGRESS_PREFIX = "ml:job:progress:"
+DOWNLOAD_PREFIX = "ml:download:"
+DOWNLOAD_JOB_PREFIX = "ml:download-job:"
 LOCK_PREFIX = "ml:lock:"
 
 _RELEASE_LOCK_LUA = """
@@ -202,6 +205,59 @@ class Store:
             "expired": int(await self.redis.zcount(SOURCE_TTL_ZSET, "-inf", time.time())),
         }
 
+    async def get_or_create_download_token(self, job_key: str, ttl: int) -> str:
+        ttl = max(60, int(ttl))
+        pointer = f"{DOWNLOAD_JOB_PREFIX}{job_key}"
+        existing = await self.redis.get(pointer)
+        if existing:
+            token = str(existing)
+            await self.redis.set(
+                f"{DOWNLOAD_PREFIX}{token}",
+                job_key,
+                nx=True,
+                ex=ttl,
+            )
+            return token
+        token = secrets.token_urlsafe(32)
+        created = await self.redis.set(pointer, token, nx=True, ex=ttl)
+        if created:
+            await self.redis.set(f"{DOWNLOAD_PREFIX}{token}", job_key, ex=ttl)
+            return token
+        winner = await self.redis.get(pointer)
+        if winner:
+            winner_token = str(winner)
+            await self.redis.set(
+                f"{DOWNLOAD_PREFIX}{winner_token}",
+                job_key,
+                nx=True,
+                ex=ttl,
+            )
+            return winner_token
+        return await self.get_or_create_download_token(job_key, ttl)
+
+    async def save_download_token(self, token: str, job_key: str, ttl: int) -> None:
+        await self.redis.set(f"{DOWNLOAD_PREFIX}{token}", job_key, ex=max(60, int(ttl)))
+        await self.redis.set(
+            f"{DOWNLOAD_JOB_PREFIX}{job_key}",
+            token,
+            nx=True,
+            ex=max(60, int(ttl)),
+        )
+
+    async def resolve_download_token(self, token: str) -> str | None:
+        value = await self.redis.get(f"{DOWNLOAD_PREFIX}{token}")
+        return str(value) if value else None
+
+    async def delete_download_token(self, token: str) -> None:
+        await self.redis.delete(f"{DOWNLOAD_PREFIX}{token}")
+
+    async def delete_download_token_for_job(self, job_key: str) -> None:
+        pointer = f"{DOWNLOAD_JOB_PREFIX}{job_key}"
+        token = await self.redis.get(pointer)
+        await self.redis.delete(pointer)
+        if token:
+            await self.redis.delete(f"{DOWNLOAD_PREFIX}{token!s}")
+
     async def get_job(self, key: str) -> dict[str, Any] | None:
         raw = await self.redis.get(_job_key(key))
         return json.loads(raw) if raw else None
@@ -237,6 +293,9 @@ class Store:
         await asyncio.to_thread(shutil.rmtree, self.job_dir(key), True)
         if record:
             await self.clear_arq_job(str(record.get("arq_job_id") or key))
+            await self.delete_download_token_for_job(key)
+            if record.get("download_token"):
+                await self.delete_download_token(str(record["download_token"]))
 
     async def cleanup_jobs(self) -> int:
         removed = 0

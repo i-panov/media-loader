@@ -468,3 +468,59 @@ async def test_orphan_queued_job_is_reenqueued(settings: Settings) -> None:
         assert arq.calls[-1][1][1] == refreshed["arq_token"]
     await client.aclose()
     await redis.aclose()
+
+
+async def test_respond_json_download_link(settings: Settings) -> None:
+    redis: Any = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    url = "https://example.com/video"
+    store = Store(redis, settings)
+    source = _source_record(settings, url)
+    await store.save_source(source)
+    await store.mark_source_ready(source)
+    app, client, arq = await _client(settings, redis)
+    async with app.router.lifespan_context(app):
+        first = await client.post(
+            "/videos",
+            json={"url": url, "format": "mkv", "respond_json": True},
+        )
+        assert first.status_code == 202
+        assert first.json()["source_cached"] is True
+        assert len(arq.calls) == 1
+
+        job_key = request_key(canonicalize_url(url), "video", "mkv", None)
+        job = await store.get_job(job_key)
+        assert job is not None
+        output_dir = settings.job_dir / job_key
+        output_dir.mkdir(parents=True)
+        output = output_dir / "result.mkv"
+        output.write_bytes(b"RESULT")
+        job.update(
+            status="ready",
+            stage="ready",
+            output_path=str(output),
+            output_filename="result.mkv",
+            content_type="video/x-matroska",
+            size=output.stat().st_size,
+            finished_at=iso(utcnow()),
+            progress={"percent": 100.0, "stage": "ready"},
+        )
+        await store.save_job(job, ttl=60)
+
+        second = await client.post(
+            "/videos",
+            json={"url": url, "format": "mkv", "respond_json": True},
+        )
+        assert second.status_code == 200
+        ready = second.json()
+        assert ready["status"] == "ready"
+        assert ready["filename"] == "result.mkv"
+        assert ready["download_url"].startswith("/downloads/")
+
+        downloaded = await client.get(ready["download_url"])
+        assert downloaded.status_code == 200
+        assert downloaded.content == b"RESULT"
+        assert downloaded.headers["cache-control"] == "private, no-store"
+
+        assert (await client.get("/downloads/invalid-token")).status_code == 404
+    await client.aclose()
+    await redis.aclose()

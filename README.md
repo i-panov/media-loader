@@ -7,6 +7,7 @@
 ## Возможности
 
 - Один публичный медиа-эндпоинт `POST /videos`.
+- Адаптивный Web UI `/ui` без npm и сборки.
 - Синхронный режим `metadata_only=true`: только метаданные, без скачивания контента и без polling.
 - Source-only кэш: один полный исходник на канонический URL.
 - TTL и LRU-eviction для source-кэша.
@@ -40,7 +41,7 @@ API (FastAPI) ──────────────► Redis
 
 | Компонент | Назначение |
 |---|---|
-| `api` | FastAPI, авторизация, кэш-хиты, постановка задач, выдача файлов |
+| `api` | FastAPI, авторизация, кэш-хиты, постановка задач, выдача файлов, статический UI |
 | `worker` | arq, загрузка source, ffmpeg, прогресс, очистка кэша |
 | `redis` | очередь, статусы, source-кэш, токены, состояния доменов; AOF |
 | `byedpi` | SOCKS5 sidecar для обхода DPI, без публикации порта |
@@ -65,6 +66,34 @@ echo "$TOKEN"
 ```
 
 Без токена `POST /videos` отвечает `401`. `/health` доступен без авторизации.
+
+## Web UI
+
+Открыть:
+
+```text
+http://127.0.0.1:8000/ui
+```
+
+UI — статические HTML/CSS/JS, без npm и сборки. Отдельного frontend-контейнера нет: страницы раздаёт API-контейнер, файлы входят в wheel. Доступны:
+
+- поле URL;
+- режим «Видео / Только аудио»;
+- видеоформат `MP4`/`MKV`;
+- аудиоформат `MP3`/`M4A`/`Opus`/`original`;
+- качество `240p`…`2160p` или «Максимум»;
+- токен API (хранится в `localStorage`, не в URL);
+- polling прогресса и кнопка скачивания.
+
+После отправки URL страницы содержит параметры запроса:
+
+```text
+/ui?url=<encoded>&audio_only=false&format=mp4&quality=720p
+```
+
+Страницу можно перезагрузить — загрузка продолжится, если job ещё жив. Polling идёт повторением `POST /videos` с `respond_json=true`; одиночные сетевые сбои повторяются автоматически. Готовый файл отдаётся по короткоживущей ссылке `/downloads/<token>`; браузер стримит его на диск, не загружая целиком в память. Токен создаётся один на job и переиспользуется при повторных polling-запросах.
+
+Статика UI публичная, но `/videos` требует Bearer-токен. Первый заход просит токен; его можно сменить кнопкой «Токен».
 
 ## Авторизация
 
@@ -119,6 +148,7 @@ curl -sS -X POST http://127.0.0.1:8000/videos \
 | `url` | string | — | HTTP/HTTPS URL |
 | `audio_only` | bool | `false` | только аудио |
 | `metadata_only` | bool | `false` | только метаданные, без контента |
+| `respond_json` | bool | `false` | всегда отвечать JSON; для UI и получения download-ссылки |
 | `format` | string | `mp4` / `mp3` | видео: `mp4`, `mkv`; аудио: `m4a`, `mp3`, `opus`, `original` |
 | `quality` | string | максимум source | `240p`, `360p`, `480p`, `720p`, `1080p`, `1440p`, `2160p`; только для видео |
 
@@ -128,7 +158,7 @@ curl -sS -X POST http://127.0.0.1:8000/videos \
 
 | Код | Значение |
 |---|---|
-| `200` | Готовый файл (метаданные в заголовках) или JSON при `metadata_only=true` |
+| `200` | Готовый файл (метаданные в заголовках), JSON при `metadata_only=true` или `respond_json=true` |
 | `202` | Задача выполняется: статус, прогресс, время старта, `retry_after` |
 | `401` | Нет, неверный или отозванный токен |
 | `422` | Невалидный URL/формат/качество, live или playlist |
@@ -269,6 +299,17 @@ media_metadata
 Перед сетевым probe API сначала читает SQLite. Метаданные не имеют TTL; при загрузке контента строка обновляется. Это значит, что просмотры/лайки могут быть неактуальны, если контент давно не скачивался.
 
 `GET /health` — без авторизации, проверяет Redis, SQLite и TCP-доступность byedpi.
+
+### UI и download-ссылки
+
+| Метод | Путь | Авторизация | Назначение |
+|---|---|---|---|
+| `GET` | `/ui` | нет | HTML-интерфейс |
+| `GET` | `/static/*` | нет | CSS/JS/иконка |
+| `GET` | `/ui/config` | нет | defaults, quality levels, форматы |
+| `GET` | `/downloads/{token}` | нет | скачивание готового job-файла по capability-токену |
+
+`respond_json=true` меняет ответ `200`: вместо файла возвращается JSON с `download_url`, `filename`, `content_type` и `size`. Download-токен создаётся один на job, переиспользуется при повторных запросах, живёт `JOB_TTL` (по умолчанию 1 час), одноразовым не является и удаляется вместе с job. Ссылка содержит секрет, поэтому её не стоит публиковать.
 
 ## Форматы и качество
 
@@ -531,6 +572,8 @@ media.example.com {
 
 Если Caddy запускается контейнером в той же Compose-сети, upstream — `api:8000`, а публикацию порта API можно убрать. Firewall должен разрешать только 22/80/443; `8000` наружу не открывать.
 
+UI доступен по `/ui` через тот же proxy. Статика UI публичная, но запросы к `/videos` требуют токен; download-ссылки `/downloads/<token>` короткоживущие и являются capability URL.
+
 ### Логи
 
 Docker-логи по умолчанию могут расти без ограничений. Для production задайте ротацию, например для `api` и `worker`:
@@ -591,6 +634,10 @@ uv run ruff check .
 uv run mypy src tests
 uv run pyright src
 
+uv run deno fmt --check src/media_loader/static/
+uv run deno lint src/media_loader/static/app.js
+uv run deno check src/media_loader/static/app.js
+
 uv run pytest
 uv run pytest --cov=media_loader --cov-report=term-missing
 ```
@@ -608,9 +655,10 @@ docker compose up -d
 - Ruff: `E/F/I/UP/B/SIM/RUF/ANN/ARG/ASYNC/C4/DTZ/PTH/RET/PERF/LOG/G/N/A/PT`, line length 100.
 - Mypy `strict` для `src` и `tests`.
 - Pyright `strict` для `src`; `reportUnknown*` отключены для динамических словарей yt-dlp/Redis, `ANN401` в Ruff — для явного `Any` на внешних границах.
-- Pytest + branch coverage с порогом **80%**; текущее покрытие ~86%.
+- UI JS проверяется установленным Deno: `deno fmt --check`, `deno lint`, `deno check`.
+- Pytest: 111 тестов, branch coverage с порогом **80%**; текущее покрытие ~86%.
 - ffmpeg-тесты автоматически пропускаются, если ffmpeg/ffprobe не установлены.
-- CI `.github/workflows/ci.yml`: ruff, mypy, pyright, тесты с покрытием и `docker compose build`.
+- CI `.github/workflows/ci.yml`: ruff, mypy, pyright, Deno-проверки UI, тесты с покрытием и `docker compose build`.
 
 ## Обновление зависимостей
 
@@ -684,7 +732,8 @@ src/media_loader/
   config.py        # настройки
   errors.py        # типизированные ошибки
   utils.py         # файлы, время, content types
+  static/          # index.html, styles.css, app.js, favicon.svg
 
-tests/             # unit/API/ffmpeg/CLI тесты
+tests/             # unit/API/ffmpeg/CLI/UI тесты
 docker/            # byedpi Dockerfile и entrypoint
 ```

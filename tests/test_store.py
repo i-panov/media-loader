@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -277,4 +278,35 @@ async def test_clear_arq_job_artifacts(settings: Settings) -> None:
     ):
         assert not await redis.exists(key)
     assert await redis.zscore("arq:queue", job_id) is None
+    await redis.aclose()
+
+
+async def test_download_tokens_and_delete_job(settings: Settings) -> None:
+    redis: Any = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    store = Store(redis, settings)
+    await store.save_download_token("token1", "job1", 60)
+    assert await store.resolve_download_token("token1") == "job1"
+    await store.save_job(
+        {
+            "request_key": "job1",
+            "status": "ready",
+            "download_token": "token1",
+            "created_at": iso(utcnow()),
+            "finished_at": iso(utcnow()),
+        }
+    )
+    await store.delete_job("job1")
+    assert await store.resolve_download_token("token1") is None
+    await store.delete_download_token("missing")
+    await redis.aclose()
+
+
+async def test_download_token_concurrency(settings: Settings) -> None:
+    redis: Any = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    store = Store(redis, settings)
+    tokens = await asyncio.gather(
+        *(store.get_or_create_download_token("job1", 60) for _ in range(10))
+    )
+    assert len(set(tokens)) == 1
+    assert await store.resolve_download_token(tokens[0]) == "job1"
     await redis.aclose()

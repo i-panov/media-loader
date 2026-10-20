@@ -20,6 +20,9 @@ jobs:
       - run: uv run ruff check .
       - run: uv run mypy src tests
       - run: uv run pyright src
+      - run: uv run deno fmt --check src/media_loader/static/
+      - run: uv run deno lint src/media_loader/static/app.js
+      - run: uv run deno check src/media_loader/static/app.js
       - run: uv run pytest --cov=media_loader --cov-report=term-missing
 
   docker:

@@ -16,6 +16,7 @@ from arq import create_pool
 from arq.connections import ArqRedis, RedisSettings
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from redis.exceptions import RedisError
 
 from media_loader.auth import authenticate_async
@@ -26,7 +27,12 @@ from media_loader.errors import InvalidRequestError, MediaLoaderError
 from media_loader.metadata_db import MetadataDatabase
 from media_loader.netcheck import fetch_metadata_with_fallback
 from media_loader.quality import plan_quality, quality_height
-from media_loader.schemas import VideoRequest, resolve_request
+from media_loader.schemas import (
+    AUDIO_FORMATS,
+    VIDEO_FORMATS,
+    VideoRequest,
+    resolve_request,
+)
 from media_loader.store import Store, job_progress_key, source_progress_key
 from media_loader.utils import (
     is_within,
@@ -39,6 +45,7 @@ from media_loader.utils import (
 from media_loader.ytdlp import metadata_to_dict
 
 LOGGER = logging.getLogger(__name__)
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
 def _job_progress_payload(progress: dict[str, Any], fallback_stage: str) -> dict[str, Any]:
@@ -99,6 +106,9 @@ async def _status_payload(
         "progress": _job_progress_payload(progress, stage),
         "title": job.get("title"),
         "description": job.get("description") or details.get("description"),
+        "filename": job.get("output_filename"),
+        "content_type": job.get("content_type"),
+        "size": job.get("size"),
         "duration": job.get("duration"),
         "thumbnail": job.get("thumbnail"),
         "uploader": details.get("uploader"),
@@ -148,10 +158,7 @@ def _failed_response(job: dict[str, Any], settings: Settings) -> JSONResponse:
     )
 
 
-async def _serve_job(
-    job: dict[str, Any],
-    store: Store,
-) -> FileResponse | None:
+def _job_output_path(job: dict[str, Any], store: Store) -> Path | None:
     if job.get("status") != "ready":
         return None
     output_path = job.get("output_path")
@@ -159,6 +166,16 @@ async def _serve_job(
         return None
     path = Path(str(output_path))
     if not path.is_file() or not is_within(store.job_dir(str(job["request_key"])), path):
+        return None
+    return path
+
+
+async def _serve_job(
+    job: dict[str, Any],
+    store: Store,
+) -> FileResponse | None:
+    path = _job_output_path(job, store)
+    if path is None:
         return None
     headers = _metadata_headers(_job_metadata(job))
     headers["X-Source-Key"] = str(job.get("source_key") or "")
@@ -420,6 +437,40 @@ async def _accepted_response(
     )
 
 
+async def _ensure_download_url(
+    store: Store,
+    settings: Settings,
+    job: dict[str, Any],
+) -> str:
+    token = await store.get_or_create_download_token(
+        str(job["request_key"]),
+        settings.job_ttl,
+    )
+    if job.get("download_token") != token:
+        job["download_token"] = token
+        await store.save_job(job, ttl=settings.job_ttl)
+    return f"/downloads/{token}"
+
+
+async def _ready_response(
+    store: Store,
+    settings: Settings,
+    job: dict[str, Any],
+) -> JSONResponse:
+    download_url = await _ensure_download_url(store, settings, job)
+    payload = await _status_payload(store, settings, job)
+    payload.update(
+        {
+            "status": "ready",
+            "download_url": download_url,
+            "filename": job.get("output_filename"),
+            "content_type": job.get("content_type"),
+            "size": job.get("size"),
+        }
+    )
+    return JSONResponse(status_code=200, content=payload)
+
+
 def create_app(
     settings: Settings | None = None,
     redis_client: aioredis.Redis | None = None,
@@ -467,10 +518,18 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.settings = app_settings
+    if STATIC_DIR.is_dir():
+        app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next: Any) -> Any:
-        if request.url.path == "/health" or not app_settings.auth_enabled:
+        path = request.url.path
+        public = (
+            path in {"/", "/ui", "/ui/config", "/health"}
+            or path.startswith("/static/")
+            or path.startswith("/downloads/")
+        )
+        if public or not app_settings.auth_enabled:
             return await call_next(request)
         header = request.headers.get("Authorization", "")
         scheme, _, token = header.partition(" ")
@@ -527,6 +586,52 @@ def create_app(
         return JSONResponse(
             status_code=200 if healthy else 503,
             content={"status": "ok" if healthy else "degraded", "checks": checks},
+        )
+
+    @app.get("/", include_in_schema=False)
+    @app.get("/ui", include_in_schema=False)
+    async def ui_index() -> FileResponse:
+        index = STATIC_DIR / "index.html"
+        if not index.is_file():
+            raise HTTPException(status_code=404, detail="UI is not installed")
+        return FileResponse(index)
+
+    @app.get("/ui/config", include_in_schema=False)
+    async def ui_config() -> JSONResponse:
+        qualities = [
+            item.strip() for item in app_settings.quality_levels.split(",") if item.strip()
+        ]
+        return JSONResponse(
+            content={
+                "auth_required": app_settings.auth_enabled,
+                "default_video_format": app_settings.default_video_format,
+                "default_audio_format": app_settings.default_audio_format,
+                "quality_levels": qualities,
+                "video_formats": sorted(VIDEO_FORMATS),
+                "audio_formats": sorted(AUDIO_FORMATS),
+            }
+        )
+
+    @app.get("/downloads/{token}", include_in_schema=False)
+    async def download(token: str, request: Request) -> FileResponse:
+        store: Store = request.app.state.store
+        job_key = await store.resolve_download_token(token)
+        if not job_key:
+            raise HTTPException(status_code=404, detail="download link expired")
+        job = await store.get_job(job_key)
+        if job is None:
+            raise HTTPException(status_code=404, detail="download link expired")
+        path = _job_output_path(job, store)
+        if path is None:
+            raise HTTPException(status_code=404, detail="file is no longer available")
+        return FileResponse(
+            path,
+            media_type=str(job.get("content_type") or "application/octet-stream"),
+            filename=str(job.get("output_filename") or path.name),
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-Cache": "DERIVED",
+            },
         )
 
     @app.post("/videos")
@@ -617,7 +722,8 @@ def create_app(
                 ),
             )
         if (
-            source
+            not payload.respond_json
+            and source
             and source.get("status") == "ready"
             and resolved.media_type == "video"
             and resolved.output_format == "mkv"
@@ -654,11 +760,17 @@ def create_app(
         existing = await store.get_job(job_key)
         if existing:
             if existing.get("status") == "ready":
-                served = await _serve_job(existing, store)
-                if served is not None:
-                    return served
-                await store.delete_job(job_key)
-                existing = None
+                if payload.respond_json:
+                    if _job_output_path(existing, store) is not None:
+                        return await _ready_response(store, app_settings, existing)
+                    await store.delete_job(job_key)
+                    existing = None
+                else:
+                    served = await _serve_job(existing, store)
+                    if served is not None:
+                        return served
+                    await store.delete_job(job_key)
+                    existing = None
             elif existing.get("status") == "failed":
                 finished = parse_dt(str(existing.get("finished_at") or ""))
                 age = (utcnow() - finished).total_seconds() if finished else 10**9
@@ -700,10 +812,22 @@ def create_app(
             existing = await store.get_job(job_key)
             if existing:
                 if existing.get("status") == "ready":
-                    served = await _serve_job(existing, store)
-                    if served is not None:
-                        return served
-                return await _accepted_response(store, app_settings, existing)
+                    if payload.respond_json:
+                        if _job_output_path(existing, store) is not None:
+                            return await _ready_response(store, app_settings, existing)
+                    else:
+                        served = await _serve_job(existing, store)
+                        if served is not None:
+                            return served
+                    await store.delete_job(job_key)
+                    existing = None
+                if existing:
+                    return await _accepted_response(store, app_settings, existing)
+                created = await store.create_job_nx(job)
+                if not created:
+                    existing = await store.get_job(job_key)
+                    if existing:
+                        return await _accepted_response(store, app_settings, existing)
         if not await _enqueue_request_job(
             request.app.state.arq,
             store,

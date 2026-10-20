@@ -21,6 +21,7 @@ class VideoRequest(BaseModel):
     url: HttpUrl
     audio_only: bool = False
     metadata_only: bool = False
+    respond_json: bool = False
     output_format: str | None = Field(default=None, alias="format")
     quality: str | None = None
 
