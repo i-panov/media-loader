@@ -80,14 +80,10 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     data_dir: Path = Path("/data")
-    cache_dir: Path = Path("/data/cache")
-    job_dir: Path = Path("/data/jobs")
-    tmp_dir: Path = Path("/data/tmp")
 
     cache_ttl: int = 24 * 3600
     cache_max_size: int = 5 * 1024**3
     cache_cleanup_interval: int = 300
-    metadata_db_path: Path = Path("/data/metadata.sqlite3")
     min_free_disk: int = 1024**3
 
     job_ttl: int = 3600
@@ -160,6 +156,22 @@ class Settings(BaseSettings):
     @property
     def timezone(self) -> ZoneInfo:
         return ZoneInfo(self.server_timezone)
+
+    @property
+    def cache_dir(self) -> Path:
+        return self.data_dir / "cache"
+
+    @property
+    def job_dir(self) -> Path:
+        return self.data_dir / "jobs"
+
+    @property
+    def tmp_dir(self) -> Path:
+        return self.data_dir / "tmp"
+
+    @property
+    def metadata_db_path(self) -> Path:
+        return self.data_dir / "metadata.sqlite3"
 
     @property
     def quality_level_set(self) -> set[str]:

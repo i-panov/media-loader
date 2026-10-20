@@ -12,10 +12,6 @@ def settings(tmp_path: Path) -> Settings:
     value = Settings(
         _env_file=None,  # type: ignore[call-arg]
         data_dir=tmp_path,
-        cache_dir=tmp_path / "cache",
-        job_dir=tmp_path / "jobs",
-        tmp_dir=tmp_path / "tmp",
-        metadata_db_path=tmp_path / "metadata.sqlite3",
         redis_url="redis://localhost:6379/0",
         auth_enabled=False,
         proxy_url="socks5://127.0.0.1:1080",

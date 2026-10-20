@@ -422,7 +422,7 @@ docker compose exec api media-loader-admin proxy-reset youtube.com
 | `CACHE_TTL` | `24h` | срок жизни source |
 | `CACHE_MAX_SIZE` | `5GB` | лимит source-кэша |
 | `CACHE_CLEANUP_INTERVAL` | `300` | шаг cron очистки, сек; до часа — минуты, от часа — часы, >24h — раз в сутки |
-| `METADATA_DB_PATH` | `/data/metadata.sqlite3` | SQLite с метаданными |
+| `HOST_DATA_DIR` | `./data` | каталог данных на хосте; монтируется в `/data` |
 | `MIN_FREE_DISK` | `1GB` | минимальный свободный запас |
 | `JOB_TTL` | `1h` | срок жизни производных файлов |
 | `JOB_TIMEOUT` | `12h` | таймаут задачи |
@@ -494,8 +494,16 @@ docker compose exec api media-loader-healthcheck
 
 ## Данные на диске
 
+Одна настройка на хосте:
+
+```dotenv
+HOST_DATA_DIR=./data
+```
+
+Compose монтирует её в `/data`. Внутри контейнера структура фиксирована:
+
 ```text
-data/
+/data/
   cache/<source_key>/source.mkv       # source максимального качества
   cache/<source_key>/source.m4a       # для аудио-платформ
   jobs/<request_key>/...              # временный производный файл
@@ -506,7 +514,16 @@ config/
   cookies.txt                         # опционально, не в git
 ```
 
-Redis хранится в named volume `media-loader_redis_data`.
+`HOST_DATA_DIR` может быть путём на внешнем диске. Контейнер работает от UID/GID 1000, поэтому каталог должен быть доступен этому пользователю:
+
+```bash
+sudo mkdir -p /mnt/storage/media-loader
+sudo chown -R 1000:1000 /mnt/storage/media-loader
+```
+
+Для переезда остановите Compose, скопируйте текущий `./data` в новый каталог, укажите `HOST_DATA_DIR` и запустите снова. Все `cache/jobs/tmp/SQLite` остаются на одной файловой системе — это важно для атомарных rename и hardlink.
+
+Redis хранится в отдельном named volume `media-loader_redis_data`.
 
 ## Production deployment
 

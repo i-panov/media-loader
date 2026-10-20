@@ -21,9 +21,6 @@ def test_settings_human_values(tmp_path: Path) -> None:
     settings = Settings(
         _env_file=None,  # type: ignore[call-arg]
         data_dir=tmp_path,
-        cache_dir=tmp_path / "cache",
-        job_dir=tmp_path / "jobs",
-        tmp_dir=tmp_path / "tmp",
         cache_ttl="24h",  # type: ignore[arg-type]
         cache_max_size="5GB",  # type: ignore[arg-type]
         quality_levels="360p,720p,1080p",
@@ -31,3 +28,7 @@ def test_settings_human_values(tmp_path: Path) -> None:
     assert settings.cache_ttl == 86400
     assert settings.cache_max_size == 5 * 1024**3
     assert settings.quality_level_set == {"360p", "720p", "1080p"}
+    assert settings.cache_dir == tmp_path / "cache"
+    assert settings.job_dir == tmp_path / "jobs"
+    assert settings.tmp_dir == tmp_path / "tmp"
+    assert settings.metadata_db_path == tmp_path / "metadata.sqlite3"
