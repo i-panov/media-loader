@@ -467,6 +467,118 @@ config/
 
 Redis хранится в named volume `media-loader_redis_data`.
 
+## Production deployment
+
+Текущая production-схема — один хост с Docker Compose. Все runtime-зависимости находятся в образах; на хосте нужны только Docker и Compose, без Python, ffmpeg, Deno и yt-dlp.
+
+### Что запускается
+
+| Контейнер | Процесс |
+|---|---|
+| `api` | `uvicorn media_loader.api:app --host 0.0.0.0 --port 8000` |
+| `worker` | `arq media_loader.worker.WorkerSettings` |
+| `redis` | `redis-server` с AOF и volume |
+| `byedpi` | `ciadpi` с SOCKS5 на `byedpi:1080` |
+
+`uvicorn` — ASGI-сервер приложения. Отдельный gunicorn/nginx внутри контейнера не используется. В образе API/worker уже есть Python, uv-venv, yt-dlp, Deno, ffmpeg и ffprobe; Redis и byedpi — отдельные образы Compose.
+
+API по умолчанию опубликован только на `127.0.0.1:8000` и не доступен из интернета напрямую.
+
+### Первый деплой
+
+```bash
+git clone git@github.com:i-panov/media-loader.git
+cd media-loader
+cp .env.example .env
+# отредактировать .env: BYEDPI_ARGS, SERVER_TIMEZONE, AUTH_ENABLED и т.д.
+
+docker compose build
+docker compose up -d
+docker compose ps
+
+docker compose exec -T api media-loader-auth create --name prod --quiet
+```
+
+Проверка:
+
+```bash
+curl -sS http://127.0.0.1:8000/health
+```
+
+### Обновление
+
+```bash
+git pull
+docker compose build
+docker compose up -d
+docker compose ps
+```
+
+Схема SQLite создаётся автоматически. Отдельной системы миграций пока нет: при изменении схемы БД понадобится ручная миграция.
+
+### TLS и reverse proxy
+
+Bearer-токены нельзя передавать по открытому HTTP. Наружу открываются только 80/443; порт API остаётся на loopback.
+
+Пример Caddy на хосте:
+
+```caddyfile
+media.example.com {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:8000
+}
+```
+
+Если Caddy запускается контейнером в той же Compose-сети, upstream — `api:8000`, а публикацию порта API можно убрать. Firewall должен разрешать только 22/80/443; `8000` наружу не открывать.
+
+### Логи
+
+Docker-логи по умолчанию могут расти без ограничений. Для production задайте ротацию, например для `api` и `worker`:
+
+```yaml
+logging:
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+```
+
+### Бэкапы
+
+- `data/metadata.sqlite3` — метаданные. Используйте SQLite backup API или `VACUUM INTO`, а не обычный `cp` при работающем WAL:
+  ```bash
+  docker compose exec -T api python -c "
+  import sqlite3
+  src = sqlite3.connect('/data/metadata.sqlite3')
+  dst = sqlite3.connect('/data/metadata.backup.sqlite3')
+  src.backup(dst)
+  dst.close()
+  src.close()
+  "
+  docker compose cp api:/data/metadata.backup.sqlite3 ./metadata.backup.sqlite3
+  ```
+- Redis volume — токены, job-статусы, proxy-состояния. При потере Redis токены нужно создать заново.
+- `config/cookies.txt` — если используется.
+- `data/cache` можно не бэкапить: source пересоздаётся из исходных URL, если он ещё доступен.
+
+### Масштабирование и ограничения
+
+- API можно масштабировать несколькими репликами за load balancer’ом: он использует Redis/SQLite, но не хранит состояние job в памяти.
+- `worker` сейчас рассчитан на один экземпляр: startup-recovery и source-lock lease не являются распределённым координатором. Не используйте `docker compose up --scale worker=2` без доработки.
+- SQLite подходит для одного хоста. Для нескольких хостов и HA нужны Postgres/Redis и объектное хранилище.
+- Метрик и per-token rate limit пока нет; для внешнего прода добавьте мониторинг и ограничения на reverse proxy/API.
+- Для горизонтального масштабирования media-файлов понадобится отдельное объектное хранилище; локальный `data/cache` — single-host решение.
+
+### Production checklist
+
+- [ ] Домен и TLS настроены, API не открыт напрямую.
+- [ ] Firewall: только SSH и 80/443.
+- [ ] Создан и сохранён production-токен; старые тестовые токены отозваны.
+- [ ] Настроены ротация логов и мониторинг диска.
+- [ ] Настроен бэкап SQLite, Redis volume и cookies.
+- [ ] `worker` запущен в одном экземпляре.
+- [ ] Проверены `/health`, metadata-only и реальная загрузка через byedpi.
+
 ## Разработка
 
 Требования: Python 3.13, uv, ffmpeg/ffprobe для ffmpeg-тестов.
