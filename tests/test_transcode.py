@@ -318,12 +318,15 @@ def test_format_plan_branches(settings: Settings) -> None:
 
 def test_probe_invalid_file(settings: Settings, tmp_path: Path) -> None:
     import asyncio
+    import shutil
 
     import pytest
 
     from media_loader.errors import DownloadFailedError
     from media_loader.transcode import probe_media
 
+    if shutil.which("ffprobe") is None:
+        pytest.skip("ffprobe is not installed")
     path = tmp_path / "bad.mp4"
     path.write_text("not a video")
     with pytest.raises(DownloadFailedError):
