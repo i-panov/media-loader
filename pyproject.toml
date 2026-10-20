@@ -1,0 +1,108 @@
+[project]
+name = "media-loader"
+version = "0.1.0"
+description = "Cache-first media downloader API with yt-dlp, ffmpeg and byedpi"
+readme = "README.md"
+authors = [
+    { name = "i-panov", email = "panov210@yandex.ru" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "arq>=0.28.0",
+    "fastapi>=0.151.0",
+    "pydantic-settings>=2.16.0",
+    "redis>=5.3.1",
+    "uvicorn[standard]>=0.54.0",
+    "yt-dlp[default,deno]>=2026.10.10.233141.dev0",
+]
+
+[project.scripts]
+media-loader-auth = "media_loader.auth:main"
+media-loader-admin = "media_loader.admin:main"
+media-loader-healthcheck = "media_loader.healthcheck:main"
+
+[build-system]
+requires = ["uv_build>=0.11.2,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "fakeredis>=2.40.0",
+    "httpx>=0.28.1",
+    "mypy>=2.4.0",
+    "pyright>=1.1.414",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.17.1",
+]
+
+[tool.uv]
+prerelease = "if-necessary-or-explicit"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I",
+    "UP",
+    "B",
+    "SIM",
+    "RUF",
+    "ANN",
+    "ARG",
+    "ASYNC",
+    "C4",
+    "DTZ",
+    "PTH",
+    "RET",
+    "PERF",
+    "LOG",
+    "G",
+    "N",
+    "A",
+    "PT",
+]
+
+ignore = ["ANN401", "ASYNC109", "ASYNC240"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN", "ARG", "PT"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+ignore_missing_imports = true
+files = ["src", "tests"]
+
+[tool.pyright]
+include = ["src"]
+exclude = [".venv", "data", "dist", "build"]
+typeCheckingMode = "strict"
+pythonVersion = "3.13"
+reportMissingTypeStubs = false
+reportUnknownArgumentType = false
+reportUnknownLambdaType = false
+reportUnknownMemberType = false
+reportUnknownParameterType = false
+reportUnknownVariableType = false
+reportDeprecated = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["media_loader"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 80

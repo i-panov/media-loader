@@ -1,0 +1,69 @@
+name: media-loader
+
+x-app: &app
+  image: media-loader:local
+  build:
+    context: .
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    TZ: ${SERVER_TIMEZONE:-Europe/Moscow}
+  volumes:
+    - ./data:/data
+    - ./config:/config:ro
+  init: true
+  restart: unless-stopped
+  depends_on:
+    redis:
+      condition: service_healthy
+    byedpi:
+      condition: service_started
+
+services:
+  byedpi:
+    image: media-loader-byedpi:local
+    build:
+      context: .
+      dockerfile: docker/byedpi.Dockerfile
+    environment:
+      BYEDPI_ARGS: ${BYEDPI_ARGS:---auto=torst --timeout 3 --tlsrec 3+s}
+    user: "1000:1000"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  redis:
+    image: redis:8.8.3-alpine
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  api:
+    <<: *app
+    command: ["uvicorn", "media_loader.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "media-loader-healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  worker:
+    <<: *app
+    command: ["arq", "media_loader.worker.WorkerSettings"]
+    stop_grace_period: 1m
+    healthcheck:
+      disable: true
+
+volumes:
+  redis_data:
