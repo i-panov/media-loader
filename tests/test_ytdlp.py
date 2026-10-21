@@ -130,7 +130,11 @@ def test_describe_audio_only_and_direct_video() -> None:
 
 
 def test_format_selector() -> None:
-    assert _format_selector(_info()) == ("bv*+ba/b", True)
+    selector, merge = _format_selector(_info())
+    assert merge is True
+    assert selector.startswith("bv*[protocol^=http]")
+    assert "format_note!*=Premium" in selector
+    assert selector.endswith("/bv*+ba/b")
     assert _format_selector({"formats": [{"vcodec": "none", "acodec": "aac"}]}) == (
         "bestaudio/best",
         False,
@@ -206,6 +210,20 @@ def test_probe_and_download_with_fake_ytdlp(
     assert result.path.name == "video.mp4"
     assert result.metadata.title == "Test video"
     assert FakeYoutubeDL.last_options["extractor_retries"] == 0
+    assert FakeYoutubeDL.last_options["concurrent_fragment_downloads"] == 4
+
+    proxied = download_source(
+        "https://example.com/video",
+        tmp_path,
+        "socks5://127.0.0.1:1080",
+        settings,
+        reporter,
+        "source1",
+        fast_fail=False,
+    )
+    assert proxied.path.name == "video.mp4"
+    assert FakeYoutubeDL.last_options["fragment_retries"] == 5
+    assert FakeYoutubeDL.last_options["concurrent_fragment_downloads"] == 1
     reporter.close()
 
 

@@ -1,5 +1,11 @@
 name: media-loader
 
+x-dns: &default-dns
+  - ${DNS1:-1.1.1.1}
+  - ${DNS2:-8.8.8.8}
+  - ${DNS3:-9.9.9.9}
+  - ${DNS4:-77.88.8.8}
+
 x-app: &app
   image: media-loader:local
   build:
@@ -9,6 +15,7 @@ x-app: &app
       required: false
   environment:
     TZ: ${SERVER_TIMEZONE:-Europe/Moscow}
+  dns: *default-dns
   volumes:
     - ${HOST_DATA_DIR:-./data}:/data
     - ./config:/config:ro
@@ -26,8 +33,12 @@ services:
     build:
       context: .
       dockerfile: docker/byedpi.Dockerfile
+      args:
+        BYEDPI_VERSION: ${BYEDPI_VERSION:-0.17.3}
+        BYEDPI_COMMIT: ${BYEDPI_COMMIT:-}
     environment:
-      BYEDPI_ARGS: ${BYEDPI_ARGS:---auto=torst --timeout 3 --tlsrec 3+s}
+      BYEDPI_ARGS: ${BYEDPI_ARGS:---tlsrec 1+s}
+    dns: *default-dns
     user: "1000:1000"
     read_only: true
     security_opt:

@@ -3,14 +3,18 @@
 FROM alpine:3.23 AS build
 
 ARG BYEDPI_VERSION=0.17.3
-ARG BYEDPI_COMMIT=7efde1b1296eaaa187b70e951894dde17527489c
+ARG BYEDPI_COMMIT=
 
 RUN apk add --no-cache build-base linux-headers git
 RUN git clone --depth 1 --branch "v${BYEDPI_VERSION}" \
         https://github.com/hufrea/byedpi.git /src
 
 WORKDIR /src
-RUN test "$(git rev-parse HEAD)" = "${BYEDPI_COMMIT}" \
+# An empty commit builds the requested tag. Set BYEDPI_COMMIT to pin the exact
+# upstream revision and make the build fail if the tag was moved.
+RUN if [ -n "${BYEDPI_COMMIT}" ]; then \
+        test "$(git rev-parse HEAD)" = "${BYEDPI_COMMIT}"; \
+    fi \
     && LDFLAGS=-static make
 
 FROM alpine:3.23

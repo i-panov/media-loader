@@ -320,6 +320,8 @@ media_metadata
 | `mp4` | H.264/AAC; remux, если source совместим, иначе transcode |
 | `mkv` | Без понижения — stream copy; при понижении — transcode видео в H.264 |
 
+При загрузке source yt-dlp отдаёт приоритет прямым HTTP(S)/DASH-форматам и не выбирает HLS/Premium, если есть прямой вариант. HLS остаётся fallback для сайтов без DASH. Это важно для byedpi: длинные HLS-фрагменты чаще рвутся при обходе DPI.
+
 ### Аудио (`audio_only=true`)
 
 | Формат | Поведение |
@@ -368,15 +370,15 @@ media_metadata
 
 ## byedpi и YouTube
 
-byedpi собирается из исходников `hufrea/byedpi` v0.17.3 в отдельный sidecar и слушает `byedpi:1080`. Наружу порт не публикуется.
+byedpi собирается из исходников `hufrea/byedpi` в отдельный sidecar и слушает `byedpi:1080`. Версия задаётся `BYEDPI_VERSION` (по умолчанию `0.17.3`). Наружу порт не публикуется.
 
 Аргументы задаются в `.env`:
 
 ```dotenv
-BYEDPI_ARGS=--auto=torst --timeout 3 --tlsrec 3+s
+BYEDPI_ARGS=--tlsrec 1+s
 ```
 
-Эта конфигурация проверена на полной загрузке YouTube: source MKV, MP3 и MP4 успешно получены.
+Эта конфигурация проверена на полной загрузке YouTube: source MKV 1080p (AV1/Opus) успешно получен. Деривация в MP3/MP4 зависит от запроса и проверяется отдельно.
 
 ### Как выбирается direct/proxy
 
@@ -392,9 +394,14 @@ BYEDPI_ARGS=--auto=torst --timeout 3 --tlsrec 3+s
 Стратегии зависят от провайдера, региона и времени. Порядок действий:
 
 ```bash
-# 1. Проверить текущую стратегию
+# 1. Проверить текущую стратегию и доступные форматы
 docker compose exec worker yt-dlp --proxy socks5://byedpi:1080 --simulate \
-  --print '%(title)s' 'https://www.youtube.com/watch?v=jNQXAC9IVRw'
+  -F 'https://www.youtube.com/watch?v=jNQXAC9IVRw'
+
+# 1a. Если direct DASH не качается, проверить другой player client
+docker compose exec worker yt-dlp --proxy socks5://byedpi:1080 --simulate \
+  --extractor-args 'youtube:player_client=tv_embedded' -F \
+  'https://www.youtube.com/watch?v=jNQXAC9IVRw'
 
 # 2. Изменить BYEDPI_ARGS в .env и пересоздать sidecar
 docker compose up -d --force-recreate byedpi
@@ -453,11 +460,33 @@ docker compose exec api media-loader-admin proxy-reset youtube.com
 
 | Переменная | По умолчанию | Описание |
 |---|---|---|
-| `BYEDPI_ARGS` | `--auto=torst --timeout 3 --tlsrec 3+s` | аргументы ciadpi |
+| `BYEDPI_VERSION` | `0.17.3` | тег `hufrea/byedpi` для сборки |
+| `BYEDPI_COMMIT` | пусто | опциональный точный SHA; пусто = доверять тегу |
+| `BYEDPI_ARGS` | `--tlsrec 1+s` | аргументы ciadpi |
 | `PROXY_URL` | `socks5://byedpi:1080` | SOCKS5 |
 | `PROXY_STATE_TTL` | `24h` | сколько помнить режим домена |
 | `DIRECT_SOCKET_TIMEOUT` | `15` | socket timeout yt-dlp |
 | `DIRECT_PROBE_TIMEOUT` | `5` | TLS probe домена |
+
+### DNS
+
+Публичные DNS задаются для контейнеров `api`, `worker` и `byedpi` через четыре переменные:
+
+```dotenv
+DNS1=1.1.1.1
+DNS2=8.8.8.8
+DNS3=9.9.9.9
+DNS4=77.88.8.8
+```
+
+Docker оставляет `127.0.0.11` для резолва имён сервисов (`redis`, `byedpi`), а внешние запросы идут через указанные серверы. Это обычный DNS по UDP/TCP; если провайдер подменяет ответы, нужен отдельный DoH/DoT-резолвер.
+
+Проверка:
+
+```bash
+docker compose exec worker getent hosts redis byedpi youtube.com
+docker compose exec worker cat /etc/resolv.conf
+```
 
 ### Авторизация
 
@@ -548,7 +577,7 @@ API по умолчанию опубликован только на `127.0.0.1:
 git clone git@github.com:i-panov/media-loader.git
 cd media-loader
 cp .env.example .env
-# отредактировать .env: BYEDPI_ARGS, SERVER_TIMEZONE, AUTH_ENABLED и т.д.
+# отредактировать .env: BYEDPI_ARGS, DNS1..DNS4, SERVER_TIMEZONE, AUTH_ENABLED и т.д.
 
 docker compose build
 docker compose up -d
@@ -688,12 +717,22 @@ docker compose build api worker
 docker compose up -d --force-recreate api worker
 ```
 
-Версия byedpi зафиксирована в `docker/byedpi.Dockerfile`; после изменения версии/коммита:
+Версия byedpi задаётся в `.env`:
+
+```dotenv
+BYEDPI_VERSION=0.17.3
+# Пусто = доверять тегу; SHA = проверить точный коммит
+BYEDPI_COMMIT=
+```
+
+Обновление:
 
 ```bash
 docker compose build byedpi
 docker compose up -d --force-recreate byedpi
 ```
+
+Пустой `BYEDPI_COMMIT` позволяет собирать любой тег. Если нужна воспроизводимость, укажите SHA из этого тега: сборка упадёт, если тег переехал.
 
 ## Troubleshooting
 

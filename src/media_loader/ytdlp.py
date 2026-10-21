@@ -306,10 +306,19 @@ def describe_media(info: dict[str, Any]) -> MediaMetadata:
     )
 
 
+_VIDEO_FORMAT_SELECTOR = (
+    "bv*[protocol^=http][format_note!*=Premium]+ba[protocol^=http]"
+    "/b[protocol^=http][format_note!*=Premium]"
+    "/bv*[protocol^=http]+ba[protocol^=http]"
+    "/b[protocol^=http]"
+    "/bv*+ba/b"
+)
+
+
 def _format_selector(info: dict[str, Any]) -> tuple[str, bool]:
     formats = info.get("formats") or []
     if _has_video_formats(info):
-        return "bv*+ba/b", True
+        return _VIDEO_FORMAT_SELECTOR, True
     if formats:
         return "bestaudio/best", False
     ext = str(info.get("ext") or "").lower()
@@ -325,13 +334,14 @@ def _base_options(
     fast_fail: bool,
 ) -> dict[str, Any]:
     retries = 0 if fast_fail else 2
+    fragment_retries = 0 if fast_fail else 5
     options: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
         "socket_timeout": settings.direct_socket_timeout,
         "retries": retries,
-        "fragment_retries": retries,
+        "fragment_retries": fragment_retries,
         "extractor_retries": retries,
         "noplaylist": True,
         "ignoreerrors": False,
@@ -430,7 +440,7 @@ def download_source(
             "windowsfilenames": True,
             "overwrites": True,
             "continuedl": False,
-            "concurrent_fragment_downloads": 4,
+            "concurrent_fragment_downloads": 1 if proxy else 4,
             "progress_hooks": [tracker.hook],
         }
     )
