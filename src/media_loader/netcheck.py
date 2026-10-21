@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 from media_loader.config import Settings
 from media_loader.domain_state import DomainState
 from media_loader.errors import DownloadFailedError, UnsupportedMediaError
-from media_loader.proxy_strategies import ProxyStrategyStore
+from media_loader.proxy_strategies import ProxyStrategyStore, ensure_proxy_strategy
 from media_loader.ytdlp import MediaMetadata, is_retryable_error, probe_source_metadata
 
 LOGGER = logging.getLogger(__name__)
@@ -84,19 +84,45 @@ async def _probe_proxy(
             # A strategy can be stale. Keep it for the downloader, but try the
             # default proxy so a metadata-only request does not fail early.
             LOGGER.debug(
-                "saved proxy strategy %s failed for metadata on %s: %s; falling back to %s",
+                "saved proxy strategy %s failed for metadata on %s: %s; falling back to base proxy",
                 strategy.get("strategy"),
                 host,
                 exc,
-                settings.proxy_url,
             )
-    return await _probe(
-        canonical_url,
-        settings.proxy_url,
-        settings,
-        False,
-        player_client=player_client,
-    )
+    try:
+        return await _probe(
+            canonical_url,
+            settings.proxy_url,
+            settings,
+            False,
+            player_client=player_client,
+        )
+    except UnsupportedMediaError:
+        raise
+    except Exception as base_exc:
+        if strategy is not None or proxy_strategies is None or not is_retryable_error(base_exc):
+            raise
+        LOGGER.debug(
+            "base proxy metadata failed for %s: %s; probing strategies",
+            host,
+            base_exc,
+        )
+        selected = await ensure_proxy_strategy(
+            canonical_url,
+            host,
+            settings,
+            proxy_strategies,
+        )
+        selected_client = (
+            str(selected.get("player_client")) if selected.get("player_client") else None
+        )
+        return await _probe(
+            canonical_url,
+            str(selected["proxy_url"]),
+            settings,
+            False,
+            player_client=selected_client,
+        )
 
 
 async def fetch_metadata_with_fallback(

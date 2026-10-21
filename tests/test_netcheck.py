@@ -253,6 +253,58 @@ async def test_metadata_after_direct_failure_uses_saved_strategy(
     await redis.aclose()
 
 
+async def test_metadata_probes_strategy_when_none_saved(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    state = DomainState(redis, settings)
+    strategies = ProxyStrategyStore(redis, settings)
+    await state.set("example.com", "proxy", "blocked")
+    calls: list[tuple[str | None, str | None]] = []
+    ensure_calls: list[str] = []
+    selected = {
+        "host": "example.com",
+        "strategy": "tlsrec1",
+        "proxy_url": "socks5://saved:1081",
+        "player_client": "tv_embedded",
+    }
+
+    async def fake_probe(
+        url: str,
+        proxy: str | None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> MediaMetadata:
+        del url, args
+        calls.append((proxy, kwargs.get("player_client")))
+        if proxy == settings.proxy_url:
+            raise RuntimeError("connection reset")
+        return _metadata()
+
+    async def fake_ensure(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        ensure_calls.append("called")
+        return selected
+
+    monkeypatch.setattr(netcheck, "_probe", fake_probe)
+    monkeypatch.setattr(netcheck, "ensure_proxy_strategy", fake_ensure)
+    result = await netcheck.fetch_metadata_with_fallback(
+        "https://example.com/video",
+        "example.com",
+        settings,
+        state,
+        strategies,
+    )
+    assert result.title == "Example"
+    assert ensure_calls == ["called"]
+    assert calls == [
+        (settings.proxy_url, None),
+        ("socks5://saved:1081", "tv_embedded"),
+    ]
+    await redis.aclose()
+
+
 async def test_metadata_probe_failure_marks_proxy(
     settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
@@ -371,7 +423,12 @@ async def test_proxy_mode_failure_and_unsupported(
     async def fail_probe(*args: Any, **kwargs: Any) -> MediaMetadata:
         raise RuntimeError("proxy down")
 
+    async def fail_ensure(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        raise RuntimeError("no strategy")
+
     monkeypatch.setattr(netcheck, "_probe", fail_probe)
+    monkeypatch.setattr(netcheck, "ensure_proxy_strategy", fail_ensure)
     with pytest.raises(DownloadFailedError):
         await netcheck.fetch_metadata_with_fallback(
             "https://example.com/video", "example.com", settings, state
