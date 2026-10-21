@@ -26,6 +26,7 @@ from media_loader.domain_state import DomainState
 from media_loader.errors import InvalidRequestError, MediaLoaderError
 from media_loader.metadata_db import MetadataDatabase
 from media_loader.netcheck import fetch_metadata_with_fallback
+from media_loader.proxy_strategies import ProxyStrategyStore
 from media_loader.quality import plan_quality, quality_height
 from media_loader.schemas import (
     AUDIO_FORMATS,
@@ -496,6 +497,7 @@ def create_app(
         app.state.redis = redis
         app.state.store = Store(redis, app_settings)
         app.state.domain_state = DomainState(redis, app_settings)
+        app.state.proxy_strategies = ProxyStrategyStore(redis, app_settings)
         app.state.arq = pool
         db = metadata_db or MetadataDatabase(app_settings.metadata_db_path)
         app.state.metadata_db = db
@@ -690,6 +692,7 @@ def create_app(
                             host_key(canonical_url),
                             app_settings,
                             request.app.state.domain_state,
+                            request.app.state.proxy_strategies,
                         )
                     except MediaLoaderError as exc:
                         raise HTTPException(

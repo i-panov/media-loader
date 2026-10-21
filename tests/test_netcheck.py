@@ -10,6 +10,7 @@ import media_loader.netcheck as netcheck
 from media_loader.config import Settings
 from media_loader.domain_state import DomainState
 from media_loader.errors import DownloadFailedError
+from media_loader.proxy_strategies import ProxyStrategyStore
 from media_loader.ytdlp import MediaMetadata
 
 
@@ -66,6 +67,189 @@ async def test_metadata_proxy_mode(
     )
     assert result.title == "Example"
     assert calls == [settings.proxy_url]
+    await redis.aclose()
+
+
+async def test_metadata_uses_saved_strategy(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    state = DomainState(redis, settings)
+    strategies = ProxyStrategyStore(redis, settings)
+    await state.set("example.com", "proxy", "blocked")
+    await strategies.set(
+        "example.com",
+        {
+            "host": "example.com",
+            "strategy": "tlsrec1",
+            "proxy_url": "socks5://saved:1081",
+            "player_client": "tv_embedded",
+        },
+    )
+    calls: list[tuple[str | None, str | None]] = []
+
+    async def fake_probe(
+        url: str,
+        proxy: str | None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> MediaMetadata:
+        del url, args
+        calls.append((proxy, kwargs.get("player_client")))
+        return _metadata()
+
+    monkeypatch.setattr(netcheck, "_probe", fake_probe)
+    result = await netcheck.fetch_metadata_with_fallback(
+        "https://example.com/video",
+        "example.com",
+        settings,
+        state,
+        strategies,
+    )
+    assert result.title == "Example"
+    assert calls == [("socks5://saved:1081", "tv_embedded")]
+    await redis.aclose()
+
+
+async def test_metadata_falls_back_to_base_when_saved_strategy_fails(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    state = DomainState(redis, settings)
+    strategies = ProxyStrategyStore(redis, settings)
+    await state.set("example.com", "proxy", "blocked")
+    await strategies.set(
+        "example.com",
+        {
+            "host": "example.com",
+            "strategy": "tlsrec1",
+            "proxy_url": "socks5://saved:1081",
+            "player_client": "tv_embedded",
+        },
+    )
+    calls: list[str | None] = []
+
+    async def fake_probe(
+        url: str,
+        proxy: str | None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> MediaMetadata:
+        del url, args, kwargs
+        calls.append(proxy)
+        if proxy == "socks5://saved:1081":
+            raise RuntimeError("connection reset")
+        return _metadata()
+
+    monkeypatch.setattr(netcheck, "_probe", fake_probe)
+    result = await netcheck.fetch_metadata_with_fallback(
+        "https://example.com/video",
+        "example.com",
+        settings,
+        state,
+        strategies,
+    )
+    assert result.title == "Example"
+    assert calls == ["socks5://saved:1081", settings.proxy_url]
+    assert await strategies.get("example.com") is not None
+    await redis.aclose()
+
+
+async def test_metadata_after_tls_probe_uses_saved_strategy(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    state = DomainState(redis, settings)
+    strategies = ProxyStrategyStore(redis, settings)
+    await strategies.set(
+        "example.com",
+        {
+            "host": "example.com",
+            "strategy": "tlsrec1",
+            "proxy_url": "socks5://saved:1081",
+            "player_client": "tv_embedded",
+        },
+    )
+    calls: list[str | None] = []
+
+    async def fake_direct(url: str, timeout: int) -> bool:
+        del url, timeout
+        return False
+
+    async def fake_probe(
+        url: str,
+        proxy: str | None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> MediaMetadata:
+        del url, args, kwargs
+        calls.append(proxy)
+        return _metadata()
+
+    monkeypatch.setattr(netcheck, "direct_available", fake_direct)
+    monkeypatch.setattr(netcheck, "_probe", fake_probe)
+    result = await netcheck.fetch_metadata_with_fallback(
+        "https://example.com/video",
+        "example.com",
+        settings,
+        state,
+        strategies,
+    )
+    assert result.title == "Example"
+    assert calls == ["socks5://saved:1081"]
+    assert await state.get_mode("example.com") == "proxy"
+    await redis.aclose()
+
+
+async def test_metadata_after_direct_failure_uses_saved_strategy(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    state = DomainState(redis, settings)
+    strategies = ProxyStrategyStore(redis, settings)
+    await strategies.set(
+        "example.com",
+        {
+            "host": "example.com",
+            "strategy": "tlsrec1",
+            "proxy_url": "socks5://saved:1081",
+            "player_client": "tv_embedded",
+        },
+    )
+    calls: list[str | None] = []
+
+    async def fake_direct(url: str, timeout: int) -> bool:
+        del url, timeout
+        return True
+
+    async def fake_probe(
+        url: str,
+        proxy: str | None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> MediaMetadata:
+        del url, args, kwargs
+        calls.append(proxy)
+        if proxy is None:
+            raise RuntimeError("connection reset")
+        return _metadata()
+
+    monkeypatch.setattr(netcheck, "direct_available", fake_direct)
+    monkeypatch.setattr(netcheck, "_probe", fake_probe)
+    result = await netcheck.fetch_metadata_with_fallback(
+        "https://example.com/video",
+        "example.com",
+        settings,
+        state,
+        strategies,
+    )
+    assert result.title == "Example"
+    assert calls == [None, "socks5://saved:1081"]
+    assert await strategies.get("example.com") is not None
     await redis.aclose()
 
 
