@@ -21,6 +21,10 @@ def test_admin_cache_stats_and_proxy_reset(
     client.zadd(SOURCE_TTL_ZSET, {"source1": 9999999999})
     client.set(SOURCE_SIZE_KEY, 123)
     client.set("ml:domain:example.com", "{}")
+    client.set(
+        "ml:proxy:strategy:example.com",
+        json.dumps({"host": "example.com", "strategy": "tlsrec1"}),
+    )
     monkeypatch.setattr(admin, "get_settings", lambda: settings)
     monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: client)
     database = MetadataDatabase(settings.metadata_db_path)
@@ -36,7 +40,12 @@ def test_admin_cache_stats_and_proxy_reset(
     assert payload["metadata_rows"] == 1
     assert payload["metadata_db_path"] == str(settings.metadata_db_path)
 
+    admin.main(["proxy-strategies"])
+    strategies = json.loads(capsys.readouterr().out)
+    assert strategies[0]["strategy"] == "tlsrec1"
+
     admin.main(["proxy-reset", "example.com"])
     assert "reset example.com: ok" in capsys.readouterr().out
     assert not client.exists("ml:domain:example.com")
+    assert not client.exists("ml:proxy:strategy:example.com")
     client.close()

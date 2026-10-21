@@ -38,7 +38,11 @@ services:
         BYEDPI_COMMIT: ${BYEDPI_COMMIT:-}
     environment:
       BYEDPI_ARGS: ${BYEDPI_ARGS:---tlsrec 1+s}
+      BYEDPI_STRATEGIES_FILE: ${BYEDPI_STRATEGIES_FILE:-/config/byedpi-strategies.conf}
+      BYEDPI_BASE_PORT: ${BYEDPI_BASE_PORT:-1080}
     dns: *default-dns
+    volumes:
+      - ./config:/config:ro
     user: "1000:1000"
     read_only: true
     security_opt:

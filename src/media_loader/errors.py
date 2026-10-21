@@ -32,3 +32,9 @@ class DownloadFailedError(MediaLoaderError):
 class LeaseLostError(MediaLoaderError):
     def __init__(self, message: str = "source lease lost") -> None:
         super().__init__(message, http_status=503, code="lease_lost")
+
+
+class ProxyProbeError(DownloadFailedError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.code = "proxy_probe_failed"

@@ -306,7 +306,7 @@ def describe_media(info: dict[str, Any]) -> MediaMetadata:
     )
 
 
-_VIDEO_FORMAT_SELECTOR = (
+VIDEO_FORMAT_SELECTOR = (
     "bv*[protocol^=http][format_note!*=Premium]+ba[protocol^=http]"
     "/b[protocol^=http][format_note!*=Premium]"
     "/bv*[protocol^=http]+ba[protocol^=http]"
@@ -318,7 +318,7 @@ _VIDEO_FORMAT_SELECTOR = (
 def _format_selector(info: dict[str, Any]) -> tuple[str, bool]:
     formats = info.get("formats") or []
     if _has_video_formats(info):
-        return _VIDEO_FORMAT_SELECTOR, True
+        return VIDEO_FORMAT_SELECTOR, True
     if formats:
         return "bestaudio/best", False
     ext = str(info.get("ext") or "").lower()
@@ -332,6 +332,7 @@ def _base_options(
     proxy: str | None,
     logger: _YtDlpLogger,
     fast_fail: bool,
+    player_client: str | None = None,
 ) -> dict[str, Any]:
     retries = 0 if fast_fail else 2
     fragment_retries = 0 if fast_fail else 5
@@ -355,6 +356,8 @@ def _base_options(
         options["ffmpeg_location"] = ffmpeg_path
     if proxy:
         options["proxy"] = proxy
+    if player_client:
+        options["extractor_args"] = {"youtube": {"player_client": [player_client]}}
     if settings.ytdlp_cookies_file.is_file():
         options["cookiefile"] = str(settings.ytdlp_cookies_file)
     return options
@@ -400,10 +403,14 @@ def probe_source_metadata(
     proxy: str | None,
     settings: Settings,
     fast_fail: bool = False,
+    player_client: str | None = None,
+    format_selector: str | None = None,
 ) -> tuple[MediaMetadata, dict[str, Any]]:
     logger = _YtDlpLogger()
-    options = _base_options(settings, proxy, logger, fast_fail)
+    options = _base_options(settings, proxy, logger, fast_fail, player_client)
     options.update({"skip_download": True})
+    if format_selector:
+        options["format"] = format_selector
     with YoutubeDL(cast(Any, options)) as ydl:
         info = _validate_info(cast(dict[str, Any], ydl.extract_info(url, download=False)))
     return describe_media(info), info
@@ -418,15 +425,22 @@ def download_source(
     source_key: str,
     fast_fail: bool = False,
     cancel_event: threading.Event | None = None,
+    player_client: str | None = None,
 ) -> DownloadResult:
     if cancel_event is not None and cancel_event.is_set():
         raise LeaseLostError
     temp_dir.mkdir(parents=True, exist_ok=True)
-    metadata, info = probe_source_metadata(url, proxy, settings, fast_fail)
+    metadata, info = probe_source_metadata(
+        url,
+        proxy,
+        settings,
+        fast_fail,
+        player_client=player_client,
+    )
     if cancel_event is not None and cancel_event.is_set():
         raise LeaseLostError
     logger = _YtDlpLogger()
-    base = _base_options(settings, proxy, logger, fast_fail)
+    base = _base_options(settings, proxy, logger, fast_fail, player_client)
 
     format_selector, merge_to_mkv = _format_selector(info)
     tracker = DownloadProgressTracker(reporter, source_key, cancel_event)

@@ -370,7 +370,7 @@ media_metadata
 
 ## byedpi и YouTube
 
-byedpi собирается из исходников `hufrea/byedpi` в отдельный sidecar и слушает `byedpi:1080`. Версия задаётся `BYEDPI_VERSION` (по умолчанию `0.17.3`). Наружу порт не публикуется.
+byedpi собирается из исходников `hufrea/byedpi` в отдельный sidecar. Версия задаётся `BYEDPI_VERSION` (по умолчанию `0.17.3`). Если файл стратегий существует, запускается пул процессов на портах `byedpi:1080..1080+N`; иначе используется один процесс с `BYEDPI_ARGS`. Наружу порты не публикуются.
 
 Аргументы задаются в `.env`:
 
@@ -403,10 +403,11 @@ docker compose exec worker yt-dlp --proxy socks5://byedpi:1080 --simulate \
   --extractor-args 'youtube:player_client=tv_embedded' -F \
   'https://www.youtube.com/watch?v=jNQXAC9IVRw'
 
-# 2. Изменить BYEDPI_ARGS в .env и пересоздать sidecar
+# 2. Изменить config/byedpi-strategies.conf (или BYEDPI_ARGS fallback)
+#    и пересоздать sidecar
 docker compose up -d --force-recreate byedpi
 
-# 3. Сбросить запомненное состояние домена
+# 3. Сбросить запомненное состояние домена и выбранную стратегию
 docker compose exec api media-loader-admin proxy-reset youtube.com
 ```
 
@@ -415,7 +416,8 @@ docker compose exec api media-loader-admin proxy-reset youtube.com
 - `--tlsrec 1+s`;
 - `--fake -1 --ttl 8 --auto=ssl_err --fake -1 --ttl 5 --udp-fake 1`;
 - `--fake -1 --ttl 8 --udp-fake 1`;
-- автоподбор через `xmaxzzz/byedpi-finder` или аналог.
+- автоподбор через `xmaxzzz/byedpi-finder` или аналог;
+- встроенный per-host автоподбор (`config/byedpi-strategies.conf`).
 
 ## Настройки
 
@@ -455,6 +457,7 @@ docker compose exec api media-loader-admin proxy-reset youtube.com
 | `AUDIO_MP3_BITRATE` | `320k` | MP3 transcode |
 | `AUDIO_OPUS_BITRATE` | `160k` | Opus transcode |
 | `YTDLP_COOKIES_FILE` | `/config/cookies.txt` | cookies для yt-dlp |
+| `YTDLP_YOUTUBE_PLAYER_CLIENTS` | `default,tv_embedded,...` | порядок player client для автоподбора |
 
 ### byedpi
 
@@ -467,6 +470,44 @@ docker compose exec api media-loader-admin proxy-reset youtube.com
 | `PROXY_STATE_TTL` | `24h` | сколько помнить режим домена |
 | `DIRECT_SOCKET_TIMEOUT` | `15` | socket timeout yt-dlp |
 | `DIRECT_PROBE_TIMEOUT` | `5` | TLS probe домена |
+| `BYEDPI_STRATEGIES_FILE` | `/config/byedpi-strategies.conf` | пул стратегий |
+| `BYEDPI_BASE_PORT` | `1080` | первый порт пула; должен совпадать с портом `PROXY_URL` (иначе будет warning) |
+| `PROXY_STRATEGY_TTL` | `24h` | TTL выбранной стратегии per-host |
+| `PROXY_PROBE_TIMEOUT` | `10` | timeout одной Range-проверки |
+| `PROXY_PROBE_TOTAL_TIMEOUT` | `90` | общий бюджет перебора |
+| `PROXY_PROBE_LOCK_TTL` | `120` | lock перебора в Redis |
+| `PROXY_PROBE_LOCK_WAIT` | `30` | ожидание чужого перебора |
+| `PROXY_PROBE_SAMPLE_BYTES` | `256KiB` | сколько байт проверять |
+
+### Автоподбор byedpi
+
+`config/byedpi-strategies.conf` содержит по одной стратегии на строку:
+
+```text
+tlsrec1 --tlsrec 1+s
+disorder1 --disorder 1
+fake-md5 --fake -1 --md5sig
+```
+
+`byedpi` запускает отдельный `ciadpi` на портах `1080..1080+N`. Приложение перебирает стратегии для заблокированного host, проверяет реальные байты через Range-запрос и сохраняет победителя в Redis:
+
+- ключ `ml:proxy:strategy:<host>`;
+- TTL по умолчанию 24 часа;
+- при транспортной ошибке сначала повторяется та же стратегия, и только при повторной ошибке она инвалидируется и запускается перебор;
+- нетранспортные ошибки (например, диск или неподдерживаемый формат) не удаляют валидную стратегию;
+- для YouTube дополнительно перебираются `YTDLP_YOUTUBE_PLAYER_CLIENTS`, начиная со штатного `default`;
+- если ни одна стратегия не дала байтов, job завершается ошибкой `proxy_probe_failed`, без бесконечного retry;
+- если один процесс пула завершается, entrypoint останавливает пул и контейнер перезапускается целиком.
+
+Диагностика:
+
+```bash
+docker compose exec api media-loader-admin proxy-strategies
+docker compose exec api media-loader-admin proxy-reset youtube.com
+docker compose logs byedpi
+```
+
+Файл `BYEDPI_ARGS` используется как fallback, если файл стратегий отсутствует или пуст.
 
 ### DNS
 
@@ -565,7 +606,7 @@ Redis хранится в отдельном named volume `media-loader_redis_da
 | `api` | `uvicorn media_loader.api:app --host 0.0.0.0 --port 8000` |
 | `worker` | `arq media_loader.worker.WorkerSettings` |
 | `redis` | `redis-server` с AOF и volume |
-| `byedpi` | `ciadpi` с SOCKS5 на `byedpi:1080` |
+| `byedpi` | пул `ciadpi` с SOCKS5 на `byedpi:1080..1080+N` |
 
 `uvicorn` — ASGI-сервер приложения. Отдельный gunicorn/nginx внутри контейнера не используется. В образе API/worker уже есть Python, uv-venv, yt-dlp, Deno, ffmpeg и ffprobe; Redis и byedpi — отдельные образы Compose.
 

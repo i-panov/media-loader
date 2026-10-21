@@ -13,6 +13,7 @@ wheels/
 .env
 config/*
 !config/.gitkeep
+!config/byedpi-strategies.conf
 config/cookies.txt
 
 # Cache and job data

@@ -248,6 +248,7 @@ function stageText(stage) {
     queued: "В очереди",
     waiting: "Ожидание источника",
     downloading: "Скачивание",
+    probing_proxy: "Подбор обхода",
     merging: "Сборка контейнера",
     remuxing: "Ремукс",
     transcoding: "Перекодирование",

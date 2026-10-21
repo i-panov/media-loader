@@ -17,6 +17,7 @@ from media_loader.domain_state import DomainState
 from media_loader.errors import DiskFullError, DownloadFailedError, LeaseLostError
 from media_loader.metadata_db import MetadataDatabase
 from media_loader.progress import ProgressReporter
+from media_loader.proxy_strategies import ProxyStrategyStore
 from media_loader.store import Store
 from media_loader.transcode import MediaInfo
 from media_loader.utils import iso, utcnow
@@ -181,12 +182,21 @@ async def test_download_with_fallback_cases(
         del url, timeout
         return False
 
+    async def fake_strategy(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        return {
+            "strategy": "default",
+            "proxy_url": str(settings.proxy_url),
+            "player_client": None,
+        }
+
     def download_ok(*args: Any, **kwargs: Any) -> DownloadResult:
         calls.append(args[2])
         return _result(tmp_path / "result.mkv")
 
     monkeypatch.setattr(worker, "direct_available", direct_ok)
     monkeypatch.setattr(worker, "download_source", download_ok)
+    monkeypatch.setattr(worker, "ensure_proxy_strategy", fake_strategy)
     job = _job()
     result = await worker._download_with_fallback(
         job,
@@ -286,6 +296,166 @@ async def test_download_with_fallback_cases(
             reporter,
             threading.Event(),
         )
+    reporter.close()
+    await redis.aclose()
+
+
+async def test_proxy_strategy_retries_transient_error_without_reprobe(
+    tmp_path: Path,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    store = Store(redis, settings)
+    strategy_store = ProxyStrategyStore(redis, settings)
+    reporter = ProgressReporter(settings, client=fakeredis.FakeRedis(decode_responses=True))
+    record = {
+        "host": "example.com",
+        "strategy": "default",
+        "proxy_url": str(settings.proxy_url),
+        "player_client": None,
+    }
+    await strategy_store.set("example.com", record)
+    attempts = 0
+    ensure_calls = 0
+
+    async def fake_ensure(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal ensure_calls
+        ensure_calls += 1
+        return record
+
+    def fake_download(*args: Any, **kwargs: Any) -> DownloadResult:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("connection reset by peer")
+        path = tmp_path / "result.mkv"
+        path.write_bytes(b"result")
+        return _result(path)
+
+    monkeypatch.setattr(worker, "ensure_proxy_strategy", fake_ensure)
+    monkeypatch.setattr(worker, "download_source", fake_download)
+    result, _ = await worker._download_with_proxy_strategy(
+        _job(),
+        "source1",
+        "https://example.com/video",
+        "example.com",
+        tmp_path,
+        settings,
+        store,
+        strategy_store,
+        reporter,
+        threading.Event(),
+    )
+    assert result.path.name == "result.mkv"
+    assert attempts == 2
+    assert ensure_calls == 0
+    assert await strategy_store.get("example.com") is not None
+    reporter.close()
+    await redis.aclose()
+
+
+async def test_proxy_strategy_reprobes_after_two_transport_errors(
+    tmp_path: Path,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    store = Store(redis, settings)
+    strategy_store = ProxyStrategyStore(redis, settings)
+    reporter = ProgressReporter(settings, client=fakeredis.FakeRedis(decode_responses=True))
+    old = {
+        "host": "example.com",
+        "strategy": "old",
+        "proxy_url": "socks5://old:1080",
+        "player_client": None,
+    }
+    new = {
+        "host": "example.com",
+        "strategy": "new",
+        "proxy_url": "socks5://new:1081",
+        "player_client": "tv_embedded",
+    }
+    await strategy_store.set("example.com", old)
+    proxy_urls: list[str] = []
+    attempts = 0
+    ensure_calls = 0
+
+    async def fake_ensure(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal ensure_calls
+        ensure_calls += 1
+        assert await strategy_store.get("example.com") is None
+        await strategy_store.set("example.com", new)
+        return new
+
+    def fake_download(*args: Any, **kwargs: Any) -> DownloadResult:
+        nonlocal attempts
+        attempts += 1
+        proxy_urls.append(str(args[2]))
+        if attempts < 3:
+            raise RuntimeError("connection reset by peer")
+        path = tmp_path / "result.mkv"
+        path.write_bytes(b"result")
+        return _result(path)
+
+    monkeypatch.setattr(worker, "ensure_proxy_strategy", fake_ensure)
+    monkeypatch.setattr(worker, "download_source", fake_download)
+    result, strategy = await worker._download_with_proxy_strategy(
+        _job(),
+        "source1",
+        "https://example.com/video",
+        "example.com",
+        tmp_path,
+        settings,
+        store,
+        strategy_store,
+        reporter,
+        threading.Event(),
+    )
+    assert result.path.name == "result.mkv"
+    assert attempts == 3
+    assert ensure_calls == 1
+    assert proxy_urls == [old["proxy_url"], old["proxy_url"], new["proxy_url"]]
+    assert strategy["strategy"] == "new"
+    reporter.close()
+    await redis.aclose()
+
+
+async def test_proxy_strategy_keeps_strategy_on_non_transport_error(
+    tmp_path: Path,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    store = Store(redis, settings)
+    strategy_store = ProxyStrategyStore(redis, settings)
+    reporter = ProgressReporter(settings, client=fakeredis.FakeRedis(decode_responses=True))
+    record = {
+        "host": "example.com",
+        "strategy": "default",
+        "proxy_url": str(settings.proxy_url),
+        "player_client": None,
+    }
+    await strategy_store.set("example.com", record)
+
+    def fake_download(*args: Any, **kwargs: Any) -> DownloadResult:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(worker, "download_source", fake_download)
+    with pytest.raises(RuntimeError, match="disk full"):
+        await worker._download_with_proxy_strategy(
+            _job(),
+            "source1",
+            "https://example.com/video",
+            "example.com",
+            tmp_path,
+            settings,
+            store,
+            strategy_store,
+            reporter,
+            threading.Event(),
+        )
+    assert await strategy_store.get("example.com") is not None
     reporter.close()
     await redis.aclose()
 

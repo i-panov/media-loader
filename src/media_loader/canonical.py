@@ -14,6 +14,7 @@ _TRACKING_PARAMS = {
     "igshid",
 }
 _YOUTUBE_HOSTS = {
+    "youtu.be",
     "youtube.com",
     "www.youtube.com",
     "m.youtube.com",
@@ -41,6 +42,11 @@ def _youtube_id(host: str, path: str, query: dict[str, str]) -> str | None:
                 candidate = path[len(prefix) :].split("/", 1)[0]
                 return candidate or None
     return None
+
+
+def is_youtube_url(raw: str) -> bool:
+    host = (urlsplit(raw).hostname or "").lower().rstrip(".")
+    return host in _YOUTUBE_HOSTS
 
 
 def canonicalize_url(raw: str) -> str:

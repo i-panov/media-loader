@@ -32,3 +32,19 @@ def test_settings_human_values(tmp_path: Path) -> None:
     assert settings.job_dir == tmp_path / "jobs"
     assert settings.tmp_dir == tmp_path / "tmp"
     assert settings.metadata_db_path == tmp_path / "metadata.sqlite3"
+    assert settings.youtube_player_clients == (
+        None,
+        "tv_embedded",
+        "web_embedded",
+        "mweb",
+        "android_vr",
+    )
+
+
+def test_youtube_player_clients_default(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,  # type: ignore[call-arg]
+        data_dir=tmp_path,
+        ytdlp_youtube_player_clients="default, tv_embedded,,",
+    )
+    assert settings.youtube_player_clients == (None, "tv_embedded")

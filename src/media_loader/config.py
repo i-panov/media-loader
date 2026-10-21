@@ -98,9 +98,18 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://redis:6379/0"
     proxy_url: str = "socks5://byedpi:1080"
+    byedpi_strategies_file: Path = Path("/config/byedpi-strategies.conf")
+    byedpi_base_port: int = 1080
     proxy_state_ttl: int = 24 * 3600
+    proxy_strategy_ttl: int = 24 * 3600
+    proxy_probe_timeout: int = 10
+    proxy_probe_total_timeout: int = 90
+    proxy_probe_lock_ttl: int = 120
+    proxy_probe_lock_wait: int = 30
+    proxy_probe_sample_bytes: int = 256 * 1024
     direct_socket_timeout: int = 15
     direct_probe_timeout: int = 5
+    ytdlp_youtube_player_clients: str = "default,tv_embedded,web_embedded,mweb,android_vr"
 
     default_video_format: str = "mp4"
     default_audio_format: str = "mp3"
@@ -129,6 +138,11 @@ class Settings(BaseSettings):
         "source_lock_ttl",
         "queued_reenqueue_seconds",
         "proxy_state_ttl",
+        "proxy_strategy_ttl",
+        "proxy_probe_timeout",
+        "proxy_probe_total_timeout",
+        "proxy_probe_lock_ttl",
+        "proxy_probe_lock_wait",
         "failed_retry_seconds",
         "failed_record_ttl",
         "retry_after_seconds",
@@ -139,7 +153,7 @@ class Settings(BaseSettings):
     def _parse_duration_fields(cls, value: object) -> int:
         return parse_duration(value)
 
-    @field_validator("cache_max_size", "min_free_disk", mode="before")
+    @field_validator("proxy_probe_sample_bytes", "cache_max_size", "min_free_disk", mode="before")
     @classmethod
     def _parse_size_field(cls, value: object) -> int:
         return parse_size(value)
@@ -176,6 +190,16 @@ class Settings(BaseSettings):
     @property
     def quality_level_set(self) -> set[str]:
         return {item.strip().lower() for item in self.quality_levels.split(",") if item.strip()}
+
+    @property
+    def youtube_player_clients(self) -> tuple[str | None, ...]:
+        values = [item.strip() for item in self.ytdlp_youtube_player_clients.split(",")]
+        clients: list[str | None] = []
+        for value in values:
+            if not value:
+                continue
+            clients.append(None if value.lower() in {"default", "auto"} else value)
+        return tuple(clients) or (None,)
 
     def ensure_dirs(self) -> None:
         for path in (self.data_dir, self.cache_dir, self.job_dir, self.tmp_dir):

@@ -119,6 +119,8 @@ async def _status_payload(
         "tags": details.get("tags") or [],
         "categories": details.get("categories") or [],
         "via_proxy": bool(job.get("via_proxy")),
+        "proxy_strategy": job.get("proxy_strategy"),
+        "player_client": job.get("player_client"),
         "attempts": int(job.get("attempts") or 0),
         "error": job.get("error"),
         "error_code": job.get("error_code"),

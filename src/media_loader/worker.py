@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import redis.asyncio as aioredis
 from arq import cron
@@ -30,6 +30,11 @@ from media_loader.errors import (
 from media_loader.metadata_db import MetadataDatabase
 from media_loader.netcheck import direct_available
 from media_loader.progress import ProgressReporter
+from media_loader.proxy_strategies import (
+    ProxyStrategyStore,
+    ensure_proxy_strategy,
+    is_proxy_strategy_error,
+)
 from media_loader.store import Store
 from media_loader.transcode import build_output_plan, probe_media, remux_to_mkv, run_ffmpeg
 from media_loader.utils import (
@@ -54,6 +59,8 @@ LOGGER = logging.getLogger(__name__)
 class AttemptResult:
     result: DownloadResult
     via_proxy: bool
+    proxy_strategy: str | None = None
+    player_client: str | None = None
 
 
 def _source_is_ready(source: dict[str, Any] | None) -> bool:
@@ -120,7 +127,10 @@ async def _download_with_fallback(
     domain_state: DomainState,
     reporter: ProgressReporter,
     cancel_event: threading.Event,
+    proxy_strategies: ProxyStrategyStore | None = None,
 ) -> AttemptResult:
+    if proxy_strategies is None:
+        proxy_strategies = ProxyStrategyStore(store.redis, settings)
     mode = await domain_state.get_mode(host)
     if mode == "proxy":
         attempts: list[bool] = [True]
@@ -151,43 +161,166 @@ async def _download_with_fallback(
         )
         if temp_dir.exists():
             await asyncio.to_thread(_clear_directory, temp_dir)
-        try:
-            result = await asyncio.to_thread(
-                download_source,
-                canonical_url,
-                temp_dir,
-                settings.proxy_url if use_proxy else None,
-                settings,
-                reporter,
-                source_key,
-                fast_fail=not use_proxy,
-                cancel_event=cancel_event,
-            )
-        except (UnsupportedMediaError, LeaseLostError):
-            raise
-        except Exception as exc:
-            last_error = exc
-            if use_proxy:
+        result: DownloadResult
+        selected_strategy: str | None = None
+        selected_client: str | None = None
+        if use_proxy:
+            try:
+                result, strategy = await _download_with_proxy_strategy(
+                    job,
+                    source_key,
+                    canonical_url,
+                    host,
+                    temp_dir,
+                    settings,
+                    store,
+                    proxy_strategies,
+                    reporter,
+                    cancel_event,
+                )
+            except (UnsupportedMediaError, LeaseLostError):
+                raise
+            except MediaLoaderError:
+                raise
+            except Exception as exc:
+                last_error = exc
                 if mode == "proxy" and (
                     "connection refused" in str(exc).lower()
                     or "name or service not known" in str(exc).lower()
                 ):
                     await domain_state.delete(host)
                 raise DownloadFailedError(str(exc)) from exc
-            if not is_retryable_error(exc):
-                raise DownloadFailedError(str(exc)) from exc
-            LOGGER.warning("direct attempt failed for %s: %s", canonical_url, exc)
-            await domain_state.set(host, "proxy", f"direct failed: {exc}")
-            continue
+            selected_strategy = str(strategy.get("strategy") or "")
+            selected_client = cast(str | None, strategy.get("player_client"))
+        else:
+            try:
+                result = await asyncio.to_thread(
+                    download_source,
+                    canonical_url,
+                    temp_dir,
+                    None,
+                    settings,
+                    reporter,
+                    source_key,
+                    fast_fail=True,
+                    cancel_event=cancel_event,
+                )
+            except (UnsupportedMediaError, LeaseLostError):
+                raise
+            except Exception as exc:
+                last_error = exc
+                if not is_retryable_error(exc):
+                    raise DownloadFailedError(str(exc)) from exc
+                LOGGER.warning("direct attempt failed for %s: %s", canonical_url, exc)
+                await domain_state.set(host, "proxy", f"direct failed: {exc}")
+                continue
 
         await domain_state.set(
             host,
             "proxy" if use_proxy else "direct",
-            "proxy download succeeded" if use_proxy else "direct download succeeded",
+            (
+                f"proxy download succeeded via {selected_strategy}"
+                if use_proxy
+                else "direct download succeeded"
+            ),
         )
-        return AttemptResult(result=result, via_proxy=use_proxy)
+        return AttemptResult(
+            result=result,
+            via_proxy=use_proxy,
+            proxy_strategy=selected_strategy or None,
+            player_client=selected_client,
+        )
 
     raise DownloadFailedError(str(last_error) if last_error else "download failed")
+
+
+async def _download_with_proxy_strategy(
+    job: dict[str, Any],
+    source_key: str,
+    canonical_url: str,
+    host: str,
+    temp_dir: Path,
+    settings: Settings,
+    store: Store,
+    proxy_strategies: ProxyStrategyStore,
+    reporter: ProgressReporter,
+    cancel_event: threading.Event,
+) -> tuple[DownloadResult, dict[str, Any]]:
+    strategy = await proxy_strategies.get(host)
+    if strategy is None:
+        job.update(stage="probing_proxy")
+        await _save_job(store, job)
+        reporter.job(
+            str(job["request_key"]),
+            stage="probing_proxy",
+            percent=0,
+            _force=True,
+        )
+        strategy = await ensure_proxy_strategy(canonical_url, host, settings, proxy_strategies)
+
+    last_error: BaseException | None = None
+    for attempt in range(3):
+        job.update(
+            stage="downloading",
+            proxy_strategy=strategy.get("strategy"),
+            player_client=strategy.get("player_client"),
+        )
+        await _save_job(store, job)
+        reporter.job(
+            str(job["request_key"]),
+            stage="downloading",
+            percent=0,
+            _force=True,
+        )
+        if temp_dir.exists():
+            await asyncio.to_thread(_clear_directory, temp_dir)
+        try:
+            result = await asyncio.to_thread(
+                download_source,
+                canonical_url,
+                temp_dir,
+                str(strategy["proxy_url"]),
+                settings,
+                reporter,
+                source_key,
+                fast_fail=False,
+                cancel_event=cancel_event,
+                player_client=cast(str | None, strategy.get("player_client")),
+            )
+            return result, strategy
+        except (UnsupportedMediaError, LeaseLostError):
+            raise
+        except Exception as exc:
+            last_error = exc
+            if not is_proxy_strategy_error(exc):
+                raise
+            if attempt == 0:
+                LOGGER.warning(
+                    "transient proxy failure for %s, retrying same strategy: %s",
+                    host,
+                    exc,
+                )
+                continue
+            await proxy_strategies.delete(host)
+            if attempt == 1:
+                LOGGER.warning("proxy strategy failed for %s, probing another: %s", host, exc)
+                job.update(stage="probing_proxy")
+                await _save_job(store, job)
+                reporter.job(
+                    str(job["request_key"]),
+                    stage="probing_proxy",
+                    percent=0,
+                    _force=True,
+                )
+                strategy = await ensure_proxy_strategy(
+                    canonical_url,
+                    host,
+                    settings,
+                    proxy_strategies,
+                )
+                continue
+            raise
+    raise DownloadFailedError(str(last_error) if last_error else "proxy download failed")
 
 
 async def _store_source(
@@ -203,6 +336,7 @@ async def _store_source(
     lock_name: str,
     lock_token: str,
     cancel_event: threading.Event,
+    proxy_strategies: ProxyStrategyStore | None = None,
 ) -> dict[str, Any]:
     temp_dir = Path(tempfile.mkdtemp(prefix=f"source-{source_key}-", dir=settings.tmp_dir))
     now = utcnow()
@@ -263,6 +397,7 @@ async def _store_source(
             domain_state,
             reporter,
             cancel_event,
+            proxy_strategies,
         )
         downloaded = await probe_media(attempt.result.path, settings)
         if downloaded.has_video:
@@ -312,6 +447,8 @@ async def _store_source(
             available_qualities=list(meta.available_qualities),
             metadata_details=meta.details,
             via_proxy=attempt.via_proxy,
+            proxy_strategy=attempt.proxy_strategy,
+            player_client=attempt.player_client,
             attempts=int(job.get("attempts") or 1),
             error=None,
         )
@@ -337,6 +474,8 @@ async def _store_source(
             LOGGER.exception("failed to save metadata to SQLite")
         job.update(
             via_proxy=attempt.via_proxy,
+            proxy_strategy=attempt.proxy_strategy,
+            player_client=attempt.player_client,
             attempts=record["attempts"],
             title=title,
             duration=record["duration"],
@@ -396,6 +535,7 @@ async def ensure_source(
     domain_state: DomainState,
     reporter: ProgressReporter,
     metadata_db: MetadataDatabase,
+    proxy_strategies: ProxyStrategyStore | None = None,
 ) -> dict[str, Any]:
     host = host_key(canonical_url)
     deadline = time.monotonic() + settings.job_timeout
@@ -442,6 +582,7 @@ async def ensure_source(
                     lock_name,
                     lock,
                     cancel_event,
+                    proxy_strategies,
                 )
             finally:
                 heartbeat.cancel()
@@ -559,6 +700,9 @@ async def process_request(
     settings: Settings = ctx["settings"]
     store: Store = ctx["store"]
     domain_state: DomainState = ctx["domain_state"]
+    proxy_strategies = ctx.get("proxy_strategies")
+    if not isinstance(proxy_strategies, ProxyStrategyStore):
+        proxy_strategies = ProxyStrategyStore(store.redis, settings)
     transcode_sem: asyncio.Semaphore = ctx["transcode_sem"]
     metadata_db: MetadataDatabase = ctx["metadata_db"]
     job = await store.get_job(request_key)
@@ -585,6 +729,7 @@ async def process_request(
             domain_state,
             reporter,
             metadata_db,
+            proxy_strategies,
         )
         await store.mark_source_access(source_key)
         now = iso(utcnow())
@@ -627,12 +772,15 @@ async def cleanup_task(ctx: dict[str, Any]) -> None:
 
 async def startup(ctx: dict[str, Any]) -> None:
     settings = get_settings()
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     settings.ensure_dirs()
     redis: Any = aioredis.Redis.from_url(settings.redis_url, decode_responses=True)
     ctx["settings"] = settings
     ctx["redis"] = redis
     ctx["store"] = Store(redis, settings)
     ctx["domain_state"] = DomainState(redis, settings)
+    ctx["proxy_strategies"] = ProxyStrategyStore(redis, settings)
     ctx["metadata_db"] = MetadataDatabase(settings.metadata_db_path)
     ctx["transcode_sem"] = asyncio.Semaphore(settings.max_concurrent_transcodes)
     recovered = await ctx["store"].recover_incomplete_jobs()

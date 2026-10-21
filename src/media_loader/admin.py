@@ -11,6 +11,7 @@ import redis
 
 from media_loader.config import get_settings
 from media_loader.domain_state import DOMAIN_PREFIX
+from media_loader.proxy_strategies import STRATEGY_PREFIX, strategy_key
 from media_loader.store import SOURCE_SIZE_KEY, SOURCE_TTL_ZSET
 from media_loader.utils import human_size
 
@@ -32,8 +33,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="media-loader-admin", description="Media cache admin")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("cache-stats", help="show source cache and job usage")
-    reset = sub.add_parser("proxy-reset", help="forget direct/proxy state for a host")
+    reset = sub.add_parser("proxy-reset", help="forget direct/proxy state and strategy")
     reset.add_argument("host")
+    sub.add_parser("proxy-strategies", help="list cached per-host proxy strategies")
     return parser
 
 
@@ -90,7 +92,18 @@ def main(argv: list[str] | None = None) -> None:
             }
             print(json.dumps(payload, indent=2, ensure_ascii=False))
         elif args.command == "proxy-reset":
-            deleted = client.delete(f"{DOMAIN_PREFIX}{args.host.lower()}")
+            host = args.host.lower()
+            deleted = client.delete(
+                f"{DOMAIN_PREFIX}{host}",
+                strategy_key(host),
+            )
             print(f"reset {args.host}: {'ok' if deleted else 'no state'}")
+        elif args.command == "proxy-strategies":
+            records: list[dict[str, Any]] = []
+            for key in sorted(client.scan_iter(match=f"{STRATEGY_PREFIX}*")):
+                raw = client.get(key)
+                if raw:
+                    records.append(json.loads(raw))
+            print(json.dumps(records, indent=2, ensure_ascii=False))
     finally:
         client.close()

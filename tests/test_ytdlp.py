@@ -191,10 +191,18 @@ def test_probe_and_download_with_fake_ytdlp(
     FakeYoutubeDL.info = _info()
     FakeYoutubeDL.raise_on_extract = None
     FakeYoutubeDL.downloaded_file = "video.mp4"
-    metadata, info = probe_source_metadata("https://example.com/video", None, settings)
+    metadata, info = probe_source_metadata(
+        "https://example.com/video",
+        None,
+        settings,
+        player_client="tv_embedded",
+    )
     assert metadata.title == "Test video"
     assert info["formats"]
     assert FakeYoutubeDL.last_options["skip_download"] is True
+    assert FakeYoutubeDL.last_options["extractor_args"] == {
+        "youtube": {"player_client": ["tv_embedded"]}
+    }
 
     redis = fakeredis.FakeRedis(decode_responses=True)
     reporter = ProgressReporter(settings, client=redis)
@@ -206,6 +214,7 @@ def test_probe_and_download_with_fake_ytdlp(
         reporter,
         "source1",
         fast_fail=True,
+        player_client="tv_embedded",
     )
     assert result.path.name == "video.mp4"
     assert result.metadata.title == "Test video"
