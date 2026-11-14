@@ -310,6 +310,12 @@ class Store:
                     await asyncio.to_thread(shutil.rmtree, path, True)
                     removed += 1
                     continue
+                expires = parse_dt(str(record.get("expires_at") or ""))
+                if expires is not None:
+                    if now > expires:
+                        await self.delete_job(path.name)
+                        removed += 1
+                    continue
                 status = record.get("status")
                 created = parse_dt(str(record.get("created_at") or ""))
                 finished = parse_dt(str(record.get("finished_at") or ""))

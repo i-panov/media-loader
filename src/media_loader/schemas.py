@@ -13,6 +13,7 @@ AUDIO_FORMATS = frozenset({"m4a", "mp3", "opus", "original"})
 MAX_FORMAT = "max"
 
 MediaType = Literal["video", "audio"]
+CollectionScope = Literal["episode", "season", "series"]
 
 
 class VideoRequest(BaseModel):
@@ -22,6 +23,7 @@ class VideoRequest(BaseModel):
     audio_only: bool = False
     metadata_only: bool = False
     respond_json: bool = False
+    scope: CollectionScope = "episode"
     output_format: str | None = Field(default=None, alias="format")
     quality: str | None = None
 

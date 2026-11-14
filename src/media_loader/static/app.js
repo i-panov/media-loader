@@ -22,6 +22,8 @@ const el = {
   audioFormatField: document.querySelector("#audio-format-field"),
   quality: document.querySelector("#quality"),
   qualityField: document.querySelector("#quality-field"),
+  scope: document.querySelector("#scope"),
+  episodeList: document.querySelector("#episode-list"),
   startButton: document.querySelector("#start-button"),
   formError: document.querySelector("#form-error"),
   statusCard: document.querySelector("#status-card"),
@@ -162,6 +164,7 @@ function paramsFromForm() {
   params.set("url", el.url.value.trim());
   params.set("audio_only", audio ? "1" : "0");
   params.set("format", audio ? el.audioFormat.value : el.videoFormat.value);
+  params.set("scope", el.scope.value);
   if (!audio && el.quality.value) {
     params.set("quality", el.quality.value);
   }
@@ -177,6 +180,10 @@ function applyLocation() {
   const params = new URLSearchParams(location.search);
   const url = params.get("url") || "";
   const rawFormat = (params.get("format") || "").toLowerCase();
+  const scope = params.get("scope") || "episode";
+  el.scope.value = ["episode", "season", "series"].includes(scope)
+    ? scope
+    : "episode";
   const audio = ["1", "true", "yes"].includes(
     (params.get("audio_only") || "").toLowerCase(),
   ) || isAudioFormat(rawFormat);
@@ -254,6 +261,7 @@ function stageText(stage) {
     transcoding: "Перекодирование",
     extracting: "Извлечение аудио",
     finalizing: "Финализация",
+    collection: "Скачивание серий",
     ready: "Готово",
     failed: "Ошибка",
   }[stage] || stage;
@@ -262,6 +270,24 @@ function stageText(stage) {
 function detailText(data) {
   if (data.status === "failed") {
     return data.error || "Не удалось выполнить запрос";
+  }
+  if (data.collection) {
+    const done = (data.episodes_ready || 0) + (data.episodes_failed || 0);
+    if (data.status === "ready") {
+      const suffix = data.partial
+        ? `, с ошибкой: ${data.episodes_failed || 0}`
+        : "";
+      return `Готово: ${data.episodes_ready || 0} из ${
+        data.episodes_total || 0
+      } серий${suffix}.`;
+    }
+    if (data.current) {
+      const label = episodeLabel(data.current.season, data.current.episode);
+      return `${label} · ${stageText(data.current.stage)} · ${done} из ${
+        data.episodes_total || 0
+      }`;
+    }
+    return `Скачивание серий: ${done} из ${data.episodes_total || 0}`;
   }
   if (data.status === "ready") {
     return "Файл готов к скачиванию.";
@@ -300,13 +326,51 @@ function renderMeta(data) {
   el.mediaMeta.hidden = parts.length === 0;
 }
 
+function renderCollectionMeta(data) {
+  const parts = [];
+  if (data.season) {
+    parts.push(`Сезон ${data.season}`);
+  } else if ((data.seasons || []).length > 1) {
+    parts.push(`Сезонов: ${data.seasons.length}`);
+  }
+  if (data.episodes_total) {
+    parts.push(`${data.episodes_total} серий`);
+  }
+  if (data.format) {
+    parts.push(String(data.format).toUpperCase());
+  }
+  if (data.quality) {
+    parts.push(String(data.quality));
+  }
+  el.mediaMeta.textContent = parts.join(" · ");
+  el.mediaMeta.hidden = parts.length === 0;
+}
+
+function episodeLabel(season, episode) {
+  if (typeof episode !== "number") {
+    return "";
+  }
+  const episodePart = `E${String(episode).padStart(2, "0")}`;
+  if (typeof season === "number" && season > 0) {
+    return `S${String(season).padStart(2, "0")}${episodePart}`;
+  }
+  return episodePart;
+}
+
 function renderStatus(data) {
   el.statusCard.hidden = false;
   el.statusCard.dataset.status = data.status || "queued";
   el.statusLabel.textContent = stageText(data.stage || data.status);
   el.statusBadge.textContent = statusText(data.status);
-  el.mediaTitle.textContent = data.title || "Загрузка";
-  renderMeta(data);
+  el.mediaTitle.textContent = data.collection && data.series?.title
+    ? data.series.title
+    : data.title || "Загрузка";
+  if (data.collection) {
+    renderCollectionMeta(data);
+  } else {
+    renderMeta(data);
+  }
+  el.episodeList.hidden = true;
 
   const progress = data.progress || {};
   const percent = typeof progress.percent === "number"
@@ -325,7 +389,73 @@ function renderStatus(data) {
   el.downloadLink.hidden = true;
 }
 
+function renderCollection(data) {
+  renderStatus({ ...data, status: "ready", stage: "ready" });
+  el.progress.value = 100;
+  el.progressText.textContent = "100%";
+  el.statusLabel.textContent = "Готово";
+  el.statusBadge.textContent = data.partial ? "Частично" : "Готово";
+  el.statusCard.dataset.status = "ready";
+  el.statusDetail.textContent = detailText({ ...data, status: "ready" });
+  renderEpisodes(data.episodes || []);
+  el.episodeList.hidden = false;
+  setBusy(false);
+  state.running = false;
+}
+
+function renderEpisodes(episodes) {
+  el.episodeList.replaceChildren();
+  let currentSeason = null;
+  for (const episode of episodes) {
+    if (
+      typeof episode.season === "number" && episode.season !== currentSeason
+    ) {
+      currentSeason = episode.season;
+      const heading = document.createElement("p");
+      heading.className = "episode-season";
+      heading.textContent = `Сезон ${currentSeason}`;
+      el.episodeList.append(heading);
+    }
+    const row = document.createElement("div");
+    row.className = "episode";
+    const label = document.createElement("span");
+    label.className = "episode-number";
+    label.textContent = episodeLabel(episode.season, episode.episode);
+    const title = document.createElement("span");
+    title.className = "episode-title";
+    title.textContent = episode.title || "Серия";
+    title.title = title.textContent;
+    row.append(label, title);
+    if (episode.status === "ready" && episode.download_url) {
+      const link = document.createElement("a");
+      link.className = "primary button-link";
+      link.href = episode.download_url;
+      link.textContent = "Скачать";
+      if (episode.filename) {
+        link.download = episode.filename;
+      }
+      row.append(link);
+    } else if (episode.status === "failed" || episode.status === "expired") {
+      const error = document.createElement("span");
+      error.className = "episode-error";
+      error.textContent = "Ошибка";
+      error.title = episode.error || "";
+      row.append(error);
+    } else {
+      const pending = document.createElement("span");
+      pending.className = "episode-status";
+      pending.textContent = statusText(episode.status);
+      row.append(pending);
+    }
+    el.episodeList.append(row);
+  }
+}
+
 function renderReady(data) {
+  if (Array.isArray(data.episodes)) {
+    renderCollection(data);
+    return;
+  }
   renderStatus({ ...data, status: "ready", stage: "ready" });
   el.progress.value = 100;
   el.progressText.textContent = "100%";
@@ -356,6 +486,7 @@ function renderError(message) {
   el.startedAt.textContent = "";
   el.statusDetail.textContent = message;
   el.downloadLink.hidden = true;
+  el.episodeList.hidden = true;
   setBusy(false);
   state.running = false;
 }
@@ -416,6 +547,7 @@ async function poll() {
         audio_only: state.request.audioOnly,
         format: state.request.format,
         quality: state.request.audioOnly ? null : state.request.quality || null,
+        scope: state.request.scope,
         respond_json: true,
       }),
       signal: controller.signal,
@@ -436,7 +568,9 @@ async function poll() {
     }
 
     if (
-      response.status === 200 && data.status === "ready" && data.download_url
+      response.status === 200 &&
+      data.status === "ready" &&
+      (data.download_url || Array.isArray(data.episodes))
     ) {
       renderReady(data);
       return;
@@ -473,11 +607,15 @@ function startRequest(params) {
     : (state.config.video_formats.includes(rawFormat)
       ? rawFormat
       : state.config.default_video_format);
+  const scope = ["episode", "season", "series"].includes(params.get("scope"))
+    ? params.get("scope")
+    : "episode";
   state.request = {
     url: params.get("url") || "",
     audioOnly,
     format,
     quality: audioOnly ? "" : (params.get("quality") || ""),
+    scope,
   };
   state.running = true;
   state.errors = 0;
@@ -493,6 +631,8 @@ function startRequest(params) {
   el.startedAt.textContent = "";
   el.statusDetail.textContent = "Отправляем запрос…";
   el.downloadLink.hidden = true;
+  el.episodeList.hidden = true;
+  el.episodeList.replaceChildren();
   poll();
 }
 
@@ -528,6 +668,8 @@ function resetView() {
   setBusy(false);
   el.statusCard.hidden = true;
   el.downloadLink.hidden = true;
+  el.episodeList.hidden = true;
+  el.episodeList.replaceChildren();
   el.statusDetail.textContent = "";
   el.mediaTitle.textContent = "Загрузка";
   el.mediaMeta.hidden = true;

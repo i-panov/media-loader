@@ -88,6 +88,11 @@ class Settings(BaseSettings):
 
     job_ttl: int = 3600
     job_timeout: int = 12 * 3600
+    collection_ttl: int = 7 * 24 * 3600
+    collection_job_timeout: int = 24 * 3600
+    max_collection_episodes: int = 0
+    series_timeout: int = 15
+    series_cache_ttl: int = 3600
     source_lock_ttl: int = 120
     queued_reenqueue_seconds: int = 10
     max_concurrent_jobs: int = 2
@@ -135,6 +140,10 @@ class Settings(BaseSettings):
         "cache_cleanup_interval",
         "job_ttl",
         "job_timeout",
+        "collection_ttl",
+        "collection_job_timeout",
+        "series_timeout",
+        "series_cache_ttl",
         "source_lock_ttl",
         "queued_reenqueue_seconds",
         "proxy_state_ttl",

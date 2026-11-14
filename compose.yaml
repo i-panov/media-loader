@@ -10,6 +10,8 @@ x-app: &app
   image: media-loader:local
   build:
     context: .
+    args:
+      DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org}
   env_file:
     - path: .env
       required: false

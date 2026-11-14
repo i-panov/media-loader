@@ -79,6 +79,15 @@
               <option value="">Максимум</option>
             </select>
           </label>
+
+            <label id="scope-field" class="field" for="scope">
+            Что скачать
+            <select id="scope">
+              <option value="episode">Одно видео</option>
+              <option value="season">Сезон</option>
+              <option value="series">Все сезоны</option>
+            </select>
+          </label>
           </div>
         </details>
 
@@ -106,6 +115,8 @@
         </div>
 
         <p id="status-detail" class="hint"></p>
+
+        <div id="episode-list" class="episode-list" hidden></div>
 
         <div class="actions">
           <a id="download-link" class="primary button-link" hidden

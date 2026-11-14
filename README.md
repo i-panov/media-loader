@@ -10,6 +10,7 @@
 - Адаптивный Web UI `/ui` без npm и сборки.
 - Синхронный режим `metadata_only=true`: только метаданные, без скачивания контента и без polling.
 - Source-only кэш: один полный исходник на канонический URL.
+- Скачивание сезона или всех сезонов сериала (`scope=season|series`): отдельные файлы с номерами `S01E02` и метаданными.
 - TTL и LRU-eviction для source-кэша.
 - Форматы видео: MP4, MKV.
 - Аудио: M4A, MP3 (по умолчанию), Opus, original.
@@ -41,9 +42,9 @@ API (FastAPI) ──────────────► Redis
 
 | Компонент | Назначение |
 |---|---|
-| `api` | FastAPI, авторизация, кэш-хиты, постановка задач, выдача файлов, статический UI |
-| `worker` | arq, загрузка source, ffmpeg, прогресс, очистка кэша |
-| `redis` | очередь, статусы, source-кэш, токены, состояния доменов; AOF |
+| `api` | FastAPI, авторизация, кэш-хиты, постановка задач, коллекции, выдача файлов, статический UI |
+| `worker` | arq, загрузка source, ffmpeg, прогресс, коллекции сезонов, очистка кэша |
+| `redis` | очередь, статусы, source-кэш, коллекции, токены, состояния доменов; AOF |
 | `byedpi` | SOCKS5 sidecar для обхода DPI, без публикации порта |
 | SQLite | постоянные метаданные в `/data/metadata.sqlite3` |
 
@@ -83,7 +84,9 @@ UI — статические HTML/CSS/JS, без npm и сборки. Отде�
 - аудиоформат `MP3`/`M4A`/`Opus`/`original`;
 - качество `240p`…`2160p` или «Максимум»;
 - токен API (хранится в `localStorage`, не в URL);
-- polling прогресса и кнопка скачивания.
+- выбор «одно видео / сезон / все сезоны»;
+- polling прогресса, список серий и отдельная кнопка скачивания для каждой;
+- кнопка скачивания одной серии.
 
 После отправки URL страницы содержит параметры запроса:
 
@@ -125,6 +128,8 @@ docker compose exec api media-loader-auth revoke --name phone
 ## API
 
 Публичный медиа-эндпоинт один: `POST /videos`. Polling выполняется повторением **того же запроса с тем же телом**.
+Сервис не только для сериалов: одиночные видео (YouTube, RuTube, VK и другие) — основной режим,
+`scope=episode`. `scope=season|series` лишь добавляет разбор сезонов/серий.
 
 ### Запрос
 
@@ -149,6 +154,7 @@ curl -sS -X POST http://127.0.0.1:8000/videos \
 | `audio_only` | bool | `false` | только аудио |
 | `metadata_only` | bool | `false` | только метаданные, без контента |
 | `respond_json` | bool | `false` | всегда отвечать JSON; для UI и получения download-ссылки |
+| `scope` | string | `episode` | `episode` — одно видео (серия или одиночный ролик), `season` — сезон указанной серии, `series` — все сезоны |
 | `format` | string | `mp4` / `mp3` | видео: `mp4`, `mkv`; аудио: `m4a`, `mp3`, `opus`, `original` |
 | `quality` | string | максимум source | `240p`, `360p`, `480p`, `720p`, `1080p`, `1440p`, `2160p`; только для видео |
 
@@ -158,7 +164,7 @@ curl -sS -X POST http://127.0.0.1:8000/videos \
 
 | Код | Значение |
 |---|---|
-| `200` | Готовый файл (метаданные в заголовках), JSON при `metadata_only=true` или `respond_json=true` |
+| `200` | Готовый файл (метаданные в заголовках), JSON при `metadata_only=true`, `respond_json=true` или для коллекции |
 | `202` | Задача выполняется: статус, прогресс, время старта, `retry_after` |
 | `401` | Нет, неверный или отозванный токен |
 | `422` | Невалидный URL/формат/качество, live или playlist |
@@ -224,6 +230,65 @@ done
 
 Мгновенный `200` без job возможен, если source уже в кэше и запрошен ровно source-формат: `format=mkv`, качество не ниже исходного.
 
+## Сезоны и сериалы
+
+Для сериалов, у которых есть сезоны и нумерация серий, можно скачать не одну серию, а весь сезон или все сезоны:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/videos \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://rutube.ru/video/<любая-серия>/",
+    "scope": "season",
+    "format": "mp4",
+    "quality": "720p"
+  }'
+```
+
+- `scope=episode` — обычный запрос одного видео (по умолчанию, поведение не изменилось). Это касается и одиночных роликов вне сериалов.
+- `scope=season` — все серии сезона, в котором находится указанная серия.
+- `scope=series` — все сезоны.
+
+Коллекция отдаётся не одним файлом, а JSON-манифестом: каждая серия скачивается отдельно по своему `download_url`. Файлы получают имена вида `S01E02 - Название.mp4`, а при скачивании — заголовки `X-Media-Season` и `X-Media-Episode`. `metadata_only=true` вместе с `scope` возвращает список серий без скачивания.
+
+```json
+{
+  "status": "ready",
+  "scope": "season",
+  "series": {"id": "rutube:891161", "title": "Универ"},
+  "season": 1,
+  "seasons": [1],
+  "episodes_total": 20,
+  "episodes_ready": 20,
+  "partial": false,
+  "episodes": [
+    {
+      "season": 1,
+      "episode": 1,
+      "title": "1 серия",
+      "status": "ready",
+      "filename": "S01E01 - 1 серия [720p].mp4",
+      "download_url": "/downloads/<token>"
+    }
+  ]
+}
+```
+
+Пока коллекция готовится, ответ `202` содержит `episodes_ready`, `episodes_total` и `current` с прогрессом текущей серии. Если часть серий не удалась, коллекция завершается `ready` с `partial=true`; ошибки — в `episodes[].error`, готовые серии остаются доступными.
+
+Как определяется сериал:
+
+- плейлисты и сезоны, которые отдают номера сезонов/серий, разбираются через yt-dlp;
+- для RuTube используется публичный API: из ссылки на серию определяется `tv_show_id`, затем список сезонов и серий;
+- если `tv_show_id` нет, RuTube ищет TV-сущность (`playlist_series`) по названию через `/api/metainfo/tv/?search=` и берёт серии из неё — так работают аниме/сериалы, выложенные плейлистом канала (например, «Старшая школа DxD»);
+- если TV-сущность не найдена, остаётся fallback по названию и каналу с разбором заголовков `N сезон M серия`;
+- в общем случае из ссылки на одну серию родительский сериал определить нельзя — передайте ссылку на плейлист/сезон;
+- RuTube-плейлисты без `tv_show_id` (playlist-серии) из «чистой» ссылки на серию не определяются: нужна ссылка на страницу сериала/плейлиста или ссылка с `?pl_id=<id>`;
+- VK Video не имеет нативной структуры «сезон/серия»: поддерживаются плейлисты `vkvideo.ru/playlist/<owner>_<id>` и `.../season_N` — серии берутся из плейлиста и сортируются по номерам из заголовков (`Сезон 1. Серия 2`). Для одиночного видео выполняется fallback-поиск по видео сообщества; он зависит от сообщества и может быть медленным. Марафон «все серии одним файлом» не разрезается.
+
+Коллекция обрабатывается последовательно: серии скачиваются и перекодируются по очереди, чтобы не перегружать диск и CPU. Серии переиспользуют обычный source-кэш; готовые файлы живут `COLLECTION_TTL`.
+
 ## Метаданные
 
 ### Только метаданные
@@ -274,6 +339,7 @@ curl -sS -X POST http://127.0.0.1:8000/videos \
 - `X-Media-Video-Codec`;
 - `X-Media-Audio-Codec`;
 - `X-Media-Size`;
+- `X-Media-Season`, `X-Media-Episode` — для файлов коллекции;
 - `X-Quality-Clamped`.
 
 Полный набор метаданных доступен через `metadata_only=true`.
@@ -343,16 +409,17 @@ media_metadata
 
 1. URL канонизируется; вычисляется `source_key` и `request_key`.
 2. API проверяет source-кэш и SQLite/Redis.
-3. При необходимости создаётся job и ставится в arq.
-4. Worker получает source:
+3. Для `scope=season|series` API разрешает список серий и создаёт коллекцию; иначе — один job.
+4. Job (или каждая серия коллекции) ставится в arq.
+5. Worker получает source:
    - direct TLS probe;
    - при неудаче — byedpi и пометка домена `proxy`;
    - direct fast-fail без долгих retry yt-dlp.
-5. yt-dlp скачивает полный source максимального качества. `yt-dlp[default,deno]` устанавливает EJS и Deno прямо в venv (`/app/.venv/bin/deno`); JS-challenges YouTube решаются без отдельного runtime-образа.
-6. Видео сохраняется как MKV (stream copy), аудио — в нативном контейнере.
-7. Из source выполняется remux/transcode в запрошенный формат и качество.
-8. Готовый производный файл живёт в `/data/jobs/<request_key>/` до `JOB_TTL`.
-9. Source остаётся в кэше до TTL/eviction.
+6. yt-dlp скачивает полный source максимального качества. `yt-dlp[default,deno]` устанавливает EJS и Deno прямо в venv (`/app/.venv/bin/deno`); JS-challenges YouTube решаются без отдельного runtime-образа.
+7. Видео сохраняется как MKV (stream copy), аудио — в нативном контейнере.
+8. Из source выполняется remux/transcode в запрошенный формат и качество.
+9. Готовый производный файл живёт в `/data/jobs/<request_key>/` до `JOB_TTL` (для коллекции — до `COLLECTION_TTL`).
+10. Source остаётся в кэше до TTL/eviction.
 
 Даже `audio_only=true` и низкое качество сначала требуют полного source максимального качества — это следствие source-only кэша.
 
@@ -432,6 +499,7 @@ docker compose exec api media-loader-admin proxy-reset youtube.com
 | `CACHE_MAX_SIZE` | `5GB` | лимит source-кэша |
 | `CACHE_CLEANUP_INTERVAL` | `300` | шаг cron очистки, сек; до часа — минуты, от часа — часы, >24h — раз в сутки |
 | `HOST_DATA_DIR` | `./data` | каталог данных на хосте; монтируется в `/data` |
+| `DATA_DIR` | `/data` | каталог внутри контейнера; менять только вместе с volume |
 | `MIN_FREE_DISK` | `1GB` | минимальный свободный запас |
 | `JOB_TTL` | `1h` | срок жизни производных файлов |
 | `JOB_TIMEOUT` | `12h` | таймаут задачи |
@@ -451,6 +519,8 @@ docker compose exec api media-loader-admin proxy-reset youtube.com
 | `DEFAULT_VIDEO_FORMAT` | `mp4` | формат видео по умолчанию |
 | `DEFAULT_AUDIO_FORMAT` | `mp3` | формат аудио по умолчанию |
 | `QUALITY_LEVELS` | `240p,...,2160p` | допустимые качества |
+| `FFMPEG_PATH` | `ffmpeg` | путь к ffmpeg |
+| `FFPROBE_PATH` | `ffprobe` | путь к ffprobe |
 | `VIDEO_CRF` | `18` | CRF для libx264 |
 | `VIDEO_PRESET` | `medium` | preset libx264 |
 | `AUDIO_AAC_BITRATE` | `256k` | AAC transcode |
@@ -458,6 +528,16 @@ docker compose exec api media-loader-admin proxy-reset youtube.com
 | `AUDIO_OPUS_BITRATE` | `160k` | Opus transcode |
 | `YTDLP_COOKIES_FILE` | `/config/cookies.txt` | cookies для yt-dlp |
 | `YTDLP_YOUTUBE_PLAYER_CLIENTS` | `default,tv_embedded,...` | порядок player client для автоподбора |
+
+### Коллекции
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `COLLECTION_TTL` | `7d` | сколько хранить готовые файлы коллекции |
+| `COLLECTION_JOB_TIMEOUT` | `24h` | таймаут одной задачи-коллекции |
+| `MAX_COLLECTION_EPISODES` | `0` | лимит серий в запросе; `0` — без лимита |
+| `SERIES_TIMEOUT` | `15s` | таймаут разрешения плейлиста/сериала |
+| `SERIES_CACHE_TTL` | `1h` | кэш списка сезонов/серий |
 
 ### byedpi
 
@@ -577,7 +657,7 @@ Compose монтирует её в `/data`. Внутри контейнера с
 /data/
   cache/<source_key>/source.mkv       # source максимального качества
   cache/<source_key>/source.m4a       # для аудио-платформ
-  jobs/<request_key>/...              # временный производный файл
+  jobs/<request_key>/...              # производные файлы; для коллекции — до COLLECTION_TTL
   tmp/                                # временные загрузки
   metadata.sqlite3                    # JSON-метаданные
 
@@ -612,6 +692,44 @@ Redis хранится в отдельном named volume `media-loader_redis_da
 `uvicorn` — ASGI-сервер приложения. Отдельный gunicorn/nginx внутри контейнера не используется. В образе API/worker уже есть Python, uv-venv, yt-dlp, Deno, ffmpeg и ffprobe; Redis и byedpi — отдельные образы Compose.
 
 API по умолчанию опубликован только на `127.0.0.1:8000` и не доступен из интернета напрямую.
+
+### Multi-arch образ (`amd64` + `arm64`)
+
+`docker compose build` собирает образ только под текущую архитектуру хоста. Для переносимого
+пакета используется GitHub Actions workflow
+[.github/workflows/release.yml](.github/workflows/release.yml): по тегу `v*` или вручную он
+собирает `linux/amd64` и `linux/arm64` на нативных runners (`ubuntu-24.04` и `ubuntu-24.04-arm`,
+без QEMU) и публикует манифест в GHCR:
+
+```text
+ghcr.io/i-panov/media-loader:<version>
+ghcr.io/i-panov/media-loader:latest
+```
+
+Проверить архитектуры опубликованного образа:
+
+```bash
+docker buildx imagetools inspect ghcr.io/i-panov/media-loader:latest
+```
+
+Локальная multi-arch сборка (без `--load`, только push в registry):
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t ghcr.io/i-panov/media-loader:dev \
+  --push .
+```
+
+Если `ubuntu-24.04-arm` недоступен (например, приватный репозиторий без arm64-runner),
+замените runner на self-hosted arm64-машину с Docker.
+
+После первого push пакет в GHCR по умолчанию приватный. Если нужен анонимный `docker pull`,
+откройте GitHub → Packages → `media-loader` → Package settings и сделайте его Public.
+
+Workflow публикует основной образ `media-loader`. `byedpi` — отдельный образ; он собирается
+из [docker/byedpi.Dockerfile](docker/byedpi.Dockerfile) и при необходимости публикуется
+аналогичным multi-arch шагом.
 
 ### Первый деплой
 
@@ -744,9 +862,10 @@ docker compose up -d
 - Mypy `strict` для `src` и `tests`.
 - Pyright `strict` для `src`; `reportUnknown*` отключены для динамических словарей yt-dlp/Redis, `ANN401` в Ruff — для явного `Any` на внешних границах.
 - UI JS проверяется установленным Deno: `deno fmt --check`, `deno lint`, `deno check`.
-- Pytest: 111 тестов, branch coverage с порогом **80%**; текущее покрытие ~86%.
+- Pytest: 154 теста, branch coverage с порогом **80%**; текущее покрытие ~81%.
 - ffmpeg-тесты автоматически пропускаются, если ffmpeg/ffprobe не установлены.
 - CI `.github/workflows/ci.yml`: ruff, mypy, pyright, Deno-проверки UI, тесты с покрытием и `docker compose build`.
+- Release `.github/workflows/release.yml`: multi-arch (`amd64`/`arm64`) сборка и публикация в GHCR по тегу `v*`.
 
 ## Обновление зависимостей
 
@@ -796,7 +915,12 @@ docker compose up -d --force-recreate byedpi
 
 ## Ограничения
 
-- Live-стримы и плейлисты не поддерживаются.
+- Live-стримы не поддерживаются.
+- Обычный запрос одной серии не принимает плейлист; для сезона/сериала используйте `scope`.
+- Из ссылки на одну серию произвольного сайта нельзя вывести сериал; нужен плейлист/сезон или поддерживаемый адаптер (RuTube).
+- RuTube-fallback требует, чтобы в заголовках были `N сезон M серия`; спецвыпуски/OVA в основной список сезонов не попадают.
+- VK-организация серий зависит от сообщества/плейлиста: возможны пропуски, дубли и смешанные плейлисты; одиночный VK-марафон не делится на серии.
+- Коллекции обрабатываются последовательно одним worker'ом; лимит серий по умолчанию не задан (`MAX_COLLECTION_EPISODES=0`).
 - DRM не поддерживается.
 - Целевой WebM/AV1 не входит в MVP.
 - yt-dlp делает pre-probe и затем download-extract; для YouTube это два прохода по страницам. Оставлено ради ранней валидации playlist/live и выбора форматов.
@@ -818,9 +942,13 @@ src/media_loader/
   ytdlp.py         # yt-dlp probe/download, метаданные
   transcode.py     # ffprobe, remux/transcode, ffmpeg progress
   netcheck.py      # TLS probe и direct/byedpi fallback
+  domain_state.py  # состояние direct/proxy на host
+  proxy_strategies.py  # подбор и хранение стратегий byedpi
   store.py         # Redis: source-кэш, job, TTL/LRU, locks
   metadata_db.py   # SQLite JSON-хранилище метаданных
   canonical.py     # канонизация URL и ключи
+  series.py        # разрешение плейлистов/сезонов, RuTube-адаптер
+  collections.py   # записи коллекций в Redis и кэш сериалов
   quality.py       # quality ladder, clamp, scale
   progress.py      # прогресс загрузки и ffmpeg
   auth.py          # токены и CLI

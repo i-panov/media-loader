@@ -21,6 +21,7 @@ from redis.exceptions import RedisError
 
 from media_loader.auth import authenticate_async
 from media_loader.canonical import canonicalize_url, host_key, request_key, source_key
+from media_loader.collections import CollectionStore, SeriesCache, collection_key
 from media_loader.config import Settings, get_settings
 from media_loader.domain_state import DomainState
 from media_loader.errors import InvalidRequestError, MediaLoaderError
@@ -31,9 +32,11 @@ from media_loader.quality import plan_quality, quality_height
 from media_loader.schemas import (
     AUDIO_FORMATS,
     VIDEO_FORMATS,
+    ResolvedRequest,
     VideoRequest,
     resolve_request,
 )
+from media_loader.series import resolve_collection
 from media_loader.store import Store, job_progress_key, source_progress_key
 from media_loader.utils import (
     is_within,
@@ -112,6 +115,8 @@ async def _status_payload(
         "size": job.get("size"),
         "duration": job.get("duration"),
         "thumbnail": job.get("thumbnail"),
+        "season": job.get("season"),
+        "episode": job.get("episode"),
         "uploader": details.get("uploader"),
         "channel": details.get("channel"),
         "upload_date": details.get("upload_date"),
@@ -284,6 +289,8 @@ def _job_metadata(job: dict[str, Any]) -> dict[str, Any]:
             "video_codec": job.get("video_codec"),
             "audio_codec": job.get("audio_codec"),
             "size": job.get("size"),
+            "season": job.get("season"),
+            "episode": job.get("episode"),
             "available_qualities": job.get("available_qualities") or [],
         }
     )
@@ -371,6 +378,8 @@ def _metadata_headers(metadata: dict[str, Any]) -> dict[str, str]:
         "width": metadata.get("width"),
         "height": metadata.get("height"),
         "size": metadata.get("size"),
+        "season": metadata.get("season"),
+        "episode": metadata.get("episode"),
         "available_qualities": metadata.get("available_qualities"),
     }
     summary = {key: value for key, value in summary.items() if value is not None}
@@ -390,6 +399,8 @@ def _metadata_headers(metadata: dict[str, Any]) -> dict[str, str]:
         "X-Media-Video-Codec": str(metadata.get("video_codec") or ""),
         "X-Media-Audio-Codec": str(metadata.get("audio_codec") or ""),
         "X-Media-Size": str(metadata.get("size") or ""),
+        "X-Media-Season": str(metadata.get("season") or ""),
+        "X-Media-Episode": str(metadata.get("episode") or ""),
         "X-Quality-Clamped": ("true" if metadata.get("quality_clamped") else "false")
         if "quality_clamped" in metadata
         else "",
@@ -445,13 +456,14 @@ async def _ensure_download_url(
     settings: Settings,
     job: dict[str, Any],
 ) -> str:
+    ttl = max(60, int(job.get("ttl") or settings.job_ttl))
     token = await store.get_or_create_download_token(
         str(job["request_key"]),
-        settings.job_ttl,
+        ttl,
     )
     if job.get("download_token") != token:
         job["download_token"] = token
-        await store.save_job(job, ttl=settings.job_ttl)
+        await store.save_job(job, ttl=ttl)
     return f"/downloads/{token}"
 
 
@@ -474,6 +486,420 @@ async def _ready_response(
     return JSONResponse(status_code=200, content=payload)
 
 
+def _collection_series(collection: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": collection.get("series_id"),
+        "title": collection.get("title"),
+    }
+
+
+def _collection_seasons(collection: dict[str, Any]) -> list[int]:
+    seasons = {
+        int(episode["season"])
+        for episode in collection.get("episodes") or []
+        if isinstance(episode, dict) and episode.get("season") is not None
+    }
+    return sorted(seasons)
+
+
+async def _collection_manifest(
+    store: Store,
+    settings: Settings,
+    collection: dict[str, Any],
+) -> dict[str, Any]:
+    episodes: list[dict[str, Any]] = []
+    ready = 0
+    failed = 0
+    expired = 0
+    for entry in collection.get("episodes") or []:
+        if not isinstance(entry, dict):
+            continue
+        request_key_value = str(entry.get("request_key") or "")
+        job = await store.get_job(request_key_value) if request_key_value else None
+        status = str((job or {}).get("status") or entry.get("status") or "queued")
+        item: dict[str, Any] = {
+            "season": entry.get("season"),
+            "episode": entry.get("episode"),
+            "title": (job or {}).get("title") or entry.get("title") or "",
+            "status": status,
+        }
+        if status == "ready":
+            if job is None or _job_output_path(job, store) is None:
+                status = "expired"
+                item["status"] = status
+                expired += 1
+            else:
+                ready += 1
+                item.update(
+                    filename=job.get("output_filename"),
+                    size=job.get("size"),
+                    duration=job.get("duration"),
+                    actual_quality=job.get("actual_quality"),
+                    content_type=job.get("content_type"),
+                    download_url=await _ensure_download_url(store, settings, job),
+                )
+        elif status == "failed":
+            failed += 1
+            item["error"] = (job or {}).get("error") or entry.get("error")
+        episodes.append(item)
+
+    if ready:
+        status = "ready"
+    elif failed or expired:
+        status = "failed"
+    else:
+        status = "processing"
+    payload: dict[str, Any] = {
+        "status": status,
+        "collection": True,
+        "scope": collection.get("scope"),
+        "series": _collection_series(collection),
+        "season": collection.get("season"),
+        "seasons": _collection_seasons(collection),
+        "media_type": collection.get("media_type"),
+        "format": collection.get("format"),
+        "quality": collection.get("quality"),
+        "episodes": episodes,
+        "episodes_total": len(episodes),
+        "episodes_ready": ready,
+        "episodes_failed": failed,
+        "episodes_expired": expired,
+        "partial": bool(ready and (failed or expired)),
+        "started_at": collection.get("started_at") or collection.get("created_at"),
+        "started_at_local": local_display(
+            parse_dt(str(collection.get("started_at") or collection.get("created_at") or "")),
+            settings.timezone,
+        ),
+        "finished_at": collection.get("finished_at"),
+        "timezone": settings.server_timezone,
+        "error": collection.get("error")
+        or ("some episodes are no longer available" if expired and not ready else None),
+        "error_code": collection.get("error_code"),
+        "retry_after": settings.retry_after_seconds,
+    }
+    return payload
+
+
+async def _collection_status_payload(
+    store: Store,
+    settings: Settings,
+    collection: dict[str, Any],
+) -> dict[str, Any]:
+    entries = [item for item in collection.get("episodes") or [] if isinstance(item, dict)]
+    total = len(entries)
+    ready = int(collection.get("episodes_ready") or 0)
+    failed = int(collection.get("episodes_failed") or 0)
+    current_payload: dict[str, Any] | None = None
+    current = collection.get("current")
+    if isinstance(current, dict) and current.get("request_key"):
+        job = await store.get_job(str(current["request_key"]))
+        if job:
+            details = await _status_payload(store, settings, job)
+            current_payload = {
+                "season": current.get("season"),
+                "episode": current.get("episode"),
+                "title": current.get("title") or details.get("title"),
+                "status": details.get("status"),
+                "stage": details.get("stage"),
+                "progress": details.get("progress"),
+            }
+    processed = ready + failed
+    percent = round(processed / total * 100.0, 2) if total else 0.0
+    if current_payload:
+        current_progress = current_payload.get("progress") or {}
+        current_percent = current_progress.get("percent")
+        if isinstance(current_percent, (int, float)) and total:
+            percent = round(min(100.0, (processed + current_percent / 100.0) / total * 100.0), 2)
+    stage = "collection"
+    if current_payload and current_payload.get("stage"):
+        stage = str(current_payload["stage"])
+    return {
+        "status": collection.get("status") or "queued",
+        "stage": stage,
+        "collection": True,
+        "scope": collection.get("scope"),
+        "series": _collection_series(collection),
+        "season": collection.get("season"),
+        "seasons": _collection_seasons(collection),
+        "media_type": collection.get("media_type"),
+        "format": collection.get("format"),
+        "quality": collection.get("quality"),
+        "episodes_total": total,
+        "episodes_ready": ready,
+        "episodes_failed": failed,
+        "current": current_payload,
+        "progress": {"percent": percent, "stage": stage},
+        "started_at": collection.get("started_at") or collection.get("created_at"),
+        "started_at_local": local_display(
+            parse_dt(str(collection.get("started_at") or collection.get("created_at") or "")),
+            settings.timezone,
+        ),
+        "finished_at": collection.get("finished_at"),
+        "timezone": settings.server_timezone,
+        "error": collection.get("error"),
+        "error_code": collection.get("error_code"),
+        "retry_after": settings.retry_after_seconds,
+    }
+
+
+def _new_collection_record(
+    collection_key_value: str,
+    scope: str,
+    spec: Any,
+    resolved: ResolvedRequest,
+    canonical_url: str,
+) -> dict[str, Any]:
+    now = iso(utcnow())
+    episodes: list[dict[str, Any]] = []
+    for episode in spec.episodes:
+        try:
+            episode_url = canonicalize_url(episode.url)
+        except ValueError:
+            episode_url = episode.url
+        episode_source_key = source_key(episode_url)
+        episodes.append(
+            {
+                "url": episode_url,
+                "canonical_url": episode_url,
+                "source_key": episode_source_key,
+                "request_key": request_key(
+                    episode_url,
+                    resolved.media_type,
+                    resolved.output_format,
+                    resolved.quality,
+                ),
+                "title": episode.title,
+                "season": episode.season,
+                "episode": episode.episode,
+                "duration": episode.duration,
+                "status": "queued",
+                "error": None,
+            }
+        )
+    return {
+        "collection_key": collection_key_value,
+        "series_id": spec.series_id,
+        "title": spec.title,
+        "scope": scope,
+        "season": spec.season,
+        "media_type": resolved.media_type,
+        "format": resolved.output_format,
+        "quality": resolved.quality,
+        "url": canonical_url,
+        "episodes": episodes,
+        "episodes_total": len(episodes),
+        "episodes_ready": 0,
+        "episodes_failed": 0,
+        "status": "queued",
+        "stage": "queued",
+        "progress": {"percent": 0.0, "stage": "queued"},
+        "current": None,
+        "created_at": now,
+        "started_at": None,
+        "finished_at": None,
+        "last_enqueued_at": None,
+        "error": None,
+        "error_code": None,
+    }
+
+
+async def _enqueue_collection(
+    arq: Any,
+    store: Store,
+    collections: CollectionStore,
+    settings: Settings,
+    record: dict[str, Any],
+) -> bool:
+    for _ in range(3):
+        token = uuid.uuid4().hex
+        arq_job_id = f"{record['collection_key']}:{token}"
+        record.update(
+            arq_token=token,
+            arq_job_id=arq_job_id,
+            last_enqueued_at=iso(utcnow()),
+        )
+        await collections.save(record)
+        try:
+            result = await arq.enqueue_job(
+                "process_collection",
+                record["collection_key"],
+                token,
+                _job_id=arq_job_id,
+                _expires=settings.collection_job_timeout + settings.collection_ttl,
+            )
+        except Exception:
+            LOGGER.exception("failed to enqueue collection %s", record.get("collection_key"))
+            return False
+        if result is not None:
+            return True
+        await store.clear_arq_job(arq_job_id)
+    return False
+
+
+async def _handle_collection(
+    request: Request,
+    payload: VideoRequest,
+    resolved: ResolvedRequest,
+    canonical_url: str,
+) -> JSONResponse:
+    settings: Settings = request.app.state.settings
+    store: Store = request.app.state.store
+    collections: CollectionStore = request.app.state.collections
+    cache: SeriesCache = request.app.state.series_cache
+
+    spec = await cache.get(canonical_url, payload.scope)
+    if spec is None:
+        try:
+            spec = await asyncio.to_thread(
+                resolve_collection,
+                canonical_url,
+                payload.scope,
+                settings,
+            )
+        except MediaLoaderError as exc:
+            raise HTTPException(status_code=exc.http_status, detail=exc.message) from exc
+        except Exception as exc:
+            LOGGER.exception("series resolution failed")
+            raise HTTPException(status_code=502, detail="failed to resolve series") from exc
+        await cache.set(canonical_url, payload.scope, spec)
+
+    limit = settings.max_collection_episodes
+    if limit and len(spec.episodes) > limit:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"series has {len(spec.episodes)} episodes; MAX_COLLECTION_EPISODES is {limit}"
+            ),
+        )
+
+    if payload.metadata_only:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "ok",
+                "metadata_only": True,
+                "collection": True,
+                "scope": payload.scope,
+                "series": {"id": spec.series_id, "title": spec.title},
+                "season": spec.season,
+                "seasons": sorted(
+                    {int(episode.season) for episode in spec.episodes if episode.season is not None}
+                ),
+                "media_type": resolved.media_type,
+                "format": resolved.output_format,
+                "quality": resolved.quality,
+                "episodes": [
+                    {
+                        "season": episode.season,
+                        "episode": episode.episode,
+                        "title": episode.title,
+                        "duration": episode.duration,
+                    }
+                    for episode in spec.episodes
+                ],
+                "episodes_total": len(spec.episodes),
+                "timezone": settings.server_timezone,
+            },
+        )
+
+    key = collection_key(
+        spec.series_id,
+        payload.scope,
+        spec.season,
+        resolved.media_type,
+        resolved.output_format,
+        resolved.quality,
+    )
+    collection = await collections.get(key)
+    if collection is not None:
+        status = str(collection.get("status") or "queued")
+        if status == "ready":
+            return JSONResponse(
+                status_code=200,
+                content=await _collection_manifest(store, settings, collection),
+            )
+        if status == "failed":
+            finished = parse_dt(str(collection.get("finished_at") or ""))
+            age = (utcnow() - finished).total_seconds() if finished else 10**9
+            if age < settings.failed_retry_seconds:
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "status": "failed",
+                        "error": collection.get("error") or "collection failed",
+                        "error_code": collection.get("error_code"),
+                        "retry_after": settings.failed_retry_seconds,
+                    },
+                    headers={"Retry-After": str(settings.failed_retry_seconds)},
+                )
+            await collections.delete(key)
+            collection = None
+        else:
+            if status == "queued":
+                last_enqueued = parse_dt(
+                    str(collection.get("last_enqueued_at") or collection.get("created_at") or "")
+                )
+                age = (utcnow() - last_enqueued).total_seconds() if last_enqueued else 10**9
+                if age >= settings.queued_reenqueue_seconds:
+                    await _enqueue_collection(
+                        request.app.state.arq,
+                        store,
+                        collections,
+                        settings,
+                        collection,
+                    )
+            return JSONResponse(
+                status_code=202,
+                content=await _collection_status_payload(store, settings, collection),
+                headers={"Retry-After": str(settings.retry_after_seconds)},
+            )
+
+    record = _new_collection_record(key, payload.scope, spec, resolved, canonical_url)
+    created = await collections.create_nx(record)
+    if not created:
+        existing = await collections.get(key)
+        if existing is not None and existing.get("status") == "ready":
+            return JSONResponse(
+                status_code=200,
+                content=await _collection_manifest(store, settings, existing),
+            )
+        if existing is not None:
+            return JSONResponse(
+                status_code=202,
+                content=await _collection_status_payload(store, settings, existing),
+                headers={"Retry-After": str(settings.retry_after_seconds)},
+            )
+        created = await collections.create_nx(record)
+        if not created:
+            raise HTTPException(status_code=503, detail="failed to create collection")
+
+    if not await _enqueue_collection(
+        request.app.state.arq,
+        store,
+        collections,
+        settings,
+        record,
+    ):
+        record.update(
+            status="failed",
+            stage="failed",
+            error="failed to enqueue collection",
+            error_code="enqueue_failed",
+            finished_at=iso(utcnow()),
+        )
+        await collections.save(record)
+        return JSONResponse(
+            status_code=503,
+            content={"status": "failed", "error": record["error"]},
+            headers={"Retry-After": "10"},
+        )
+    return JSONResponse(
+        status_code=202,
+        content=await _collection_status_payload(store, settings, record),
+        headers={"Retry-After": str(settings.retry_after_seconds)},
+    )
+
+
 def create_app(
     settings: Settings | None = None,
     redis_client: aioredis.Redis | None = None,
@@ -481,6 +907,7 @@ def create_app(
     metadata_db: MetadataDatabase | None = None,
 ) -> FastAPI:
     app_settings = settings or get_settings()
+    logging.getLogger().setLevel(app_settings.log_level.upper())
     owned_redis = redis_client is None
     owned_pool = arq_pool is None
     owned_metadata_db = metadata_db is None
@@ -498,6 +925,8 @@ def create_app(
         app.state.store = Store(redis, app_settings)
         app.state.domain_state = DomainState(redis, app_settings)
         app.state.proxy_strategies = ProxyStrategyStore(redis, app_settings)
+        app.state.collections = CollectionStore(redis, app_settings)
+        app.state.series_cache = SeriesCache(redis, app_settings)
         app.state.arq = pool
         db = metadata_db or MetadataDatabase(app_settings.metadata_db_path)
         app.state.metadata_db = db
@@ -628,14 +1057,18 @@ def create_app(
         path = _job_output_path(job, store)
         if path is None:
             raise HTTPException(status_code=404, detail="file is no longer available")
+        headers = _metadata_headers(_job_metadata(job))
+        headers.update(
+            {
+                "Cache-Control": "private, no-store",
+                "X-Cache": "DERIVED",
+            }
+        )
         return FileResponse(
             path,
             media_type=str(job.get("content_type") or "application/octet-stream"),
             filename=str(job.get("output_filename") or path.name),
-            headers={
-                "Cache-Control": "private, no-store",
-                "X-Cache": "DERIVED",
-            },
+            headers=headers,
         )
 
     @app.post("/videos")
@@ -649,6 +1082,9 @@ def create_app(
             canonical_url = canonicalize_url(str(payload.url))
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        if payload.scope != "episode":
+            return await _handle_collection(request, payload, resolved, canonical_url)
 
         key = source_key(canonical_url)
         job_key = request_key(

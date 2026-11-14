@@ -461,3 +461,66 @@ progress::-moz-progress-bar {
     animation: none !important;
   }
 }
+
+.episode-list {
+  display: grid;
+  gap: 8px;
+  max-height: 420px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.episode-season {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.episode {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-small);
+}
+
+.episode-number {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.episode-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 0.9rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.episode .button-link {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  font-size: 0.8rem;
+}
+
+.episode-error,
+.episode-status {
+  flex: 0 0 auto;
+  font-size: 0.8rem;
+}
+
+.episode-error {
+  color: var(--danger);
+}
+
+.episode-status {
+  color: var(--muted);
+}

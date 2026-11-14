@@ -13,11 +13,12 @@ from pathlib import Path
 from typing import Any, ClassVar, cast
 
 import redis.asyncio as aioredis
-from arq import cron
+from arq import cron, func
 from arq.connections import RedisSettings
 
 from media_loader.auth import AUTH_NAMES_KEY
 from media_loader.canonical import host_key
+from media_loader.collections import CollectionStore
 from media_loader.config import Settings, get_settings
 from media_loader.domain_state import DomainState
 from media_loader.errors import (
@@ -611,10 +612,31 @@ async def ensure_source(
             raise DownloadFailedError("timed out waiting for source download")
 
 
-def _title_for_output(title: str, media_type: str, actual_quality: str | None, suffix: str) -> str:
+def _int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _title_for_output(
+    title: str,
+    media_type: str,
+    actual_quality: str | None,
+    suffix: str,
+    season: int | None = None,
+    episode: int | None = None,
+) -> str:
     base = title
     if media_type == "video" and actual_quality:
         base = f"{base} [{actual_quality}]"
+    if season is not None and episode is not None:
+        base = f"S{season:02d}E{episode:02d} - {base}"
+    elif episode is not None:
+        base = f"E{episode:02d} - {base}"
     return safe_filename(base, "media", f".{suffix}")
 
 
@@ -648,6 +670,8 @@ async def _derive(
         media_type,
         plan.actual_quality,
         plan.suffix,
+        _int_or_none(job.get("season")),
+        _int_or_none(job.get("episode")),
     )
     output_path = job_dir / filename
     if plan.copy_source:
@@ -687,34 +711,22 @@ async def _derive(
         error_code=None,
         http_status=200,
     )
+    ttl = max(60, int(job.get("ttl") or settings.job_ttl))
     job["progress"] = {"percent": 100.0, "stage": "ready"}
-    await store.save_job(job, ttl=settings.job_ttl)
+    job["expires_at"] = iso(utcnow() + timedelta(seconds=ttl))
+    await store.save_job(job, ttl=ttl)
     reporter.job(str(job["request_key"]), stage="ready", percent=100, _force=True)
 
 
-async def process_request(
-    ctx: dict[str, Any],
-    request_key: str,
-    arq_token: str | None = None,
+async def _process_job(
+    settings: Settings,
+    store: Store,
+    domain_state: DomainState,
+    metadata_db: MetadataDatabase,
+    transcode_sem: asyncio.Semaphore,
+    proxy_strategies: ProxyStrategyStore,
+    job: dict[str, Any],
 ) -> None:
-    settings: Settings = ctx["settings"]
-    store: Store = ctx["store"]
-    domain_state: DomainState = ctx["domain_state"]
-    proxy_strategies = ctx.get("proxy_strategies")
-    if not isinstance(proxy_strategies, ProxyStrategyStore):
-        proxy_strategies = ProxyStrategyStore(store.redis, settings)
-    transcode_sem: asyncio.Semaphore = ctx["transcode_sem"]
-    metadata_db: MetadataDatabase = ctx["metadata_db"]
-    job = await store.get_job(request_key)
-    if not job:
-        LOGGER.warning("job %s disappeared before processing", request_key)
-        return
-    if arq_token and job.get("arq_token") and arq_token != job["arq_token"]:
-        LOGGER.info("stale arq job %s ignored", request_key)
-        return
-    if job.get("status") in {"ready", "failed"}:
-        return
-
     source_key = str(job["source_key"])
     canonical_url = str(job["canonical_url"])
     reporter = ProgressReporter(settings)
@@ -760,6 +772,289 @@ async def process_request(
         await store.decr_active(source_key)
 
 
+async def process_request(
+    ctx: dict[str, Any],
+    request_key: str,
+    arq_token: str | None = None,
+) -> None:
+    settings: Settings = ctx["settings"]
+    store: Store = ctx["store"]
+    domain_state: DomainState = ctx["domain_state"]
+    proxy_strategies = ctx.get("proxy_strategies")
+    if not isinstance(proxy_strategies, ProxyStrategyStore):
+        proxy_strategies = ProxyStrategyStore(store.redis, settings)
+    transcode_sem: asyncio.Semaphore = ctx["transcode_sem"]
+    metadata_db: MetadataDatabase = ctx["metadata_db"]
+    job = await store.get_job(request_key)
+    if not job:
+        LOGGER.warning("job %s disappeared before processing", request_key)
+        return
+    if arq_token and job.get("arq_token") and arq_token != job["arq_token"]:
+        LOGGER.info("stale arq job %s ignored", request_key)
+        return
+    if job.get("status") in {"ready", "failed"}:
+        return
+    await _process_job(
+        settings,
+        store,
+        domain_state,
+        metadata_db,
+        transcode_sem,
+        proxy_strategies,
+        job,
+    )
+
+
+async def _wait_for_job(
+    store: Store,
+    request_key: str,
+    timeout: float,
+) -> dict[str, Any] | None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        job = await store.get_job(request_key)
+        if job and job.get("status") in {"ready", "failed"}:
+            return job
+        await asyncio.sleep(2)
+    return await store.get_job(request_key)
+
+
+def _collection_job(
+    collection: dict[str, Any],
+    episode: dict[str, Any],
+    settings: Settings,
+) -> dict[str, Any]:
+    now = iso(utcnow())
+    return {
+        "request_key": str(episode["request_key"]),
+        "source_key": str(episode["source_key"]),
+        "url": str(episode["url"]),
+        "canonical_url": str(episode.get("canonical_url") or episode["url"]),
+        "media_type": str(collection["media_type"]),
+        "format": str(collection["format"]),
+        "quality": collection.get("quality"),
+        "collection_key": str(collection["collection_key"]),
+        "season": episode.get("season"),
+        "episode": episode.get("episode"),
+        "source_cached": False,
+        "status": "queued",
+        "stage": "queued",
+        "created_at": now,
+        "download_started_at": None,
+        "processing_started_at": None,
+        "finished_at": None,
+        "title": episode.get("title"),
+        "duration": episode.get("duration"),
+        "thumbnail": None,
+        "description": None,
+        "available_qualities": [],
+        "metadata_details": {},
+        "source_quality": None,
+        "actual_quality": None,
+        "quality_clamped": False,
+        "via_proxy": False,
+        "attempts": 0,
+        "error": None,
+        "error_code": None,
+        "http_status": None,
+        "progress": {"percent": 0.0, "stage": "queued"},
+        "ttl": settings.collection_ttl,
+    }
+
+
+def _apply_job_to_episode(episode: dict[str, Any], job: dict[str, Any]) -> None:
+    episode.update(
+        status=job.get("status") or "failed",
+        error=job.get("error"),
+        title=job.get("title") or episode.get("title"),
+        size=job.get("size"),
+        filename=job.get("output_filename"),
+        duration=job.get("duration") or episode.get("duration"),
+        actual_quality=job.get("actual_quality"),
+    )
+
+
+def _update_collection_counts(collection: dict[str, Any]) -> None:
+    entries = [item for item in collection.get("episodes") or [] if isinstance(item, dict)]
+    ready = sum(1 for item in entries if item.get("status") == "ready")
+    failed = sum(1 for item in entries if item.get("status") == "failed")
+    total = len(entries)
+    processed = ready + failed
+    collection["episodes_ready"] = ready
+    collection["episodes_failed"] = failed
+    collection["episodes_total"] = total
+    collection["progress"] = {
+        "percent": round(processed / total * 100.0, 2) if total else 0.0,
+        "stage": "collection",
+    }
+
+
+async def process_collection(
+    ctx: dict[str, Any],
+    collection_key: str,
+    arq_token: str | None = None,
+) -> None:
+    settings: Settings = ctx["settings"]
+    store: Store = ctx["store"]
+    domain_state: DomainState = ctx["domain_state"]
+    collections: CollectionStore = ctx["collections"]
+    proxy_strategies = ctx.get("proxy_strategies")
+    if not isinstance(proxy_strategies, ProxyStrategyStore):
+        proxy_strategies = ProxyStrategyStore(store.redis, settings)
+    transcode_sem: asyncio.Semaphore = ctx["transcode_sem"]
+    metadata_db: MetadataDatabase = ctx["metadata_db"]
+
+    collection = await collections.get(collection_key)
+    if not collection:
+        LOGGER.warning("collection %s disappeared before processing", collection_key)
+        return
+    if arq_token and collection.get("arq_token") and arq_token != collection["arq_token"]:
+        LOGGER.info("stale arq collection job %s ignored", collection_key)
+        return
+    if collection.get("status") in {"ready", "failed"}:
+        return
+
+    collection.update(
+        status="processing",
+        stage="processing",
+        started_at=collection.get("started_at") or iso(utcnow()),
+        error=None,
+        error_code=None,
+    )
+    await collections.save(collection)
+    try:
+        entries = [item for item in collection.get("episodes") or [] if isinstance(item, dict)]
+        for episode in entries:
+            request_key_value = str(episode["request_key"])
+            existing = await store.get_job(request_key_value)
+            output_path = str((existing or {}).get("output_path") or "")
+            if (
+                existing
+                and existing.get("status") == "ready"
+                and output_path
+                and Path(output_path).is_file()
+            ):
+                existing["ttl"] = settings.collection_ttl
+                existing["expires_at"] = iso(utcnow() + timedelta(seconds=settings.collection_ttl))
+                await store.save_job(existing, ttl=settings.collection_ttl)
+                _apply_job_to_episode(episode, existing)
+                _update_collection_counts(collection)
+                await collections.save(collection)
+                continue
+
+            if existing and existing.get("status") not in {"ready", "failed"}:
+                if existing.get("status") == "queued":
+                    existing.update(
+                        arq_token=f"collection:{collection_key}",
+                        ttl=settings.collection_ttl,
+                        collection_key=collection_key,
+                        season=episode.get("season"),
+                        episode=episode.get("episode"),
+                        title=existing.get("title") or episode.get("title"),
+                    )
+                    await store.save_job(existing, ttl=settings.collection_ttl)
+                    job = existing
+                else:
+                    waited = await _wait_for_job(
+                        store,
+                        request_key_value,
+                        settings.retry_after_seconds * 12,
+                    )
+                    if (
+                        waited
+                        and waited.get("status") == "ready"
+                        and str(waited.get("output_path") or "")
+                        and Path(str(waited["output_path"])).is_file()
+                    ):
+                        waited["ttl"] = settings.collection_ttl
+                        waited["expires_at"] = iso(
+                            utcnow() + timedelta(seconds=settings.collection_ttl)
+                        )
+                        await store.save_job(waited, ttl=settings.collection_ttl)
+                        _apply_job_to_episode(episode, waited)
+                        _update_collection_counts(collection)
+                        await collections.save(collection)
+                        continue
+                    if waited and waited.get("status") not in {"ready", "failed"}:
+                        episode.update(
+                            status="failed",
+                            error="episode is already being processed by another request",
+                        )
+                        _update_collection_counts(collection)
+                        await collections.save(collection)
+                        continue
+                    job = _collection_job(collection, episode, settings)
+                    job["arq_token"] = f"collection:{collection_key}"
+                    await store.save_job(job, ttl=settings.collection_ttl)
+            else:
+                job = _collection_job(collection, episode, settings)
+                job["arq_token"] = f"collection:{collection_key}"
+                await store.save_job(job, ttl=settings.collection_ttl)
+            collection["current"] = {
+                "request_key": request_key_value,
+                "season": episode.get("season"),
+                "episode": episode.get("episode"),
+                "title": episode.get("title"),
+            }
+            _update_collection_counts(collection)
+            await collections.save(collection)
+            await _process_job(
+                settings,
+                store,
+                domain_state,
+                metadata_db,
+                transcode_sem,
+                proxy_strategies,
+                job,
+            )
+            processed = await store.get_job(request_key_value)
+            if processed:
+                _apply_job_to_episode(episode, processed)
+            else:
+                episode.update(status="failed", error="episode job disappeared")
+            collection["current"] = None
+            _update_collection_counts(collection)
+            await collections.save(collection)
+    except Exception as exc:
+        LOGGER.exception("collection %s failed", collection_key)
+        collection.update(
+            status="failed",
+            stage="failed",
+            error=str(exc)[-2000:],
+            error_code="collection_failed",
+            finished_at=iso(utcnow()),
+        )
+        collection["progress"] = {"percent": None, "stage": "failed"}
+        collection["current"] = None
+        await collections.save(collection)
+        return
+
+    _update_collection_counts(collection)
+    finished = iso(utcnow())
+    if int(collection.get("episodes_ready") or 0):
+        collection.update(
+            status="ready",
+            stage="ready",
+            finished_at=finished,
+            error=None,
+            error_code=None,
+            partial=bool(collection.get("episodes_failed")),
+        )
+        collection["progress"] = {"percent": 100.0, "stage": "ready"}
+    else:
+        collection.update(
+            status="failed",
+            stage="failed",
+            finished_at=finished,
+            error="all episodes failed",
+            error_code="collection_failed",
+        )
+        collection["progress"] = {"percent": None, "stage": "failed"}
+    collection["current"] = None
+    collection["expires_at"] = iso(utcnow() + timedelta(seconds=settings.collection_ttl))
+    await collections.save(collection)
+
+
 async def cleanup_task(ctx: dict[str, Any]) -> None:
     store: Store = ctx["store"]
     try:
@@ -772,6 +1067,7 @@ async def cleanup_task(ctx: dict[str, Any]) -> None:
 
 async def startup(ctx: dict[str, Any]) -> None:
     settings = get_settings()
+    logging.getLogger().setLevel(settings.log_level.upper())
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     settings.ensure_dirs()
@@ -781,11 +1077,18 @@ async def startup(ctx: dict[str, Any]) -> None:
     ctx["store"] = Store(redis, settings)
     ctx["domain_state"] = DomainState(redis, settings)
     ctx["proxy_strategies"] = ProxyStrategyStore(redis, settings)
+    ctx["collections"] = CollectionStore(redis, settings)
     ctx["metadata_db"] = MetadataDatabase(settings.metadata_db_path)
     ctx["transcode_sem"] = asyncio.Semaphore(settings.max_concurrent_transcodes)
     recovered = await ctx["store"].recover_incomplete_jobs()
     if recovered:
         LOGGER.warning("recovered %s incomplete jobs after worker restart", recovered)
+    recovered_collections = await ctx["collections"].recover_incomplete(ctx["store"])
+    if recovered_collections:
+        LOGGER.warning(
+            "recovered %s incomplete collections after worker restart",
+            recovered_collections,
+        )
     if settings.auth_enabled and await redis.hlen(AUTH_NAMES_KEY) == 0:
         LOGGER.warning(
             "no API tokens configured; create one with media-loader-auth create --name ..."
@@ -811,7 +1114,10 @@ def _cleanup_schedule(interval: int) -> tuple[set[int] | None, set[int]]:
 
 class WorkerSettings:
     settings = get_settings()
-    functions: ClassVar[list[Any]] = [process_request]
+    functions: ClassVar[list[Any]] = [
+        process_request,
+        func(process_collection, timeout=settings.collection_job_timeout),
+    ]
     cleanup_hour, cleanup_minute = _cleanup_schedule(settings.cache_cleanup_interval)
     cron_jobs: ClassVar[list[Any]] = [
         cron(
