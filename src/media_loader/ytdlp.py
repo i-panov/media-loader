@@ -363,17 +363,36 @@ def _base_options(
     return options
 
 
+def _result_file(info: dict[str, Any]) -> Path | None:
+    paths: list[Any] = [info.get("filepath")]
+    paths.extend(
+        item.get("filepath")
+        for item in info.get("requested_downloads") or []
+        if isinstance(item, dict)
+    )
+    for value in paths:
+        if not isinstance(value, str) or not value:
+            continue
+        path = Path(value)
+        if path.is_file() and path.suffix.lower() not in _IGNORED_SUFFIXES:
+            return path
+    return None
+
+
 def _find_media_file(temp_dir: Path) -> Path:
     candidates = [
         path
         for path in temp_dir.rglob("*")
-        if path.is_file()
-        and path.suffix.lower() not in _IGNORED_SUFFIXES
-        and not any(part.startswith(".") for part in path.relative_to(temp_dir).parts)
+        if path.is_file() and path.suffix.lower() not in _IGNORED_SUFFIXES
     ]
     if not candidates:
         raise DownloadError("downloaded file not found")
-    return max(candidates, key=lambda path: path.stat().st_size)
+    visible = [
+        path
+        for path in candidates
+        if not any(part.startswith(".") for part in path.relative_to(temp_dir).parts)
+    ]
+    return max(visible or candidates, key=lambda path: path.stat().st_size)
 
 
 def metadata_to_dict(metadata: MediaMetadata) -> dict[str, Any]:
@@ -466,5 +485,5 @@ def download_source(
 
     if cancel_event is not None and cancel_event.is_set():
         raise LeaseLostError
-    path = _find_media_file(temp_dir)
+    path = _result_file(downloaded) or _find_media_file(temp_dir)
     return DownloadResult(path=path, metadata=metadata, info=downloaded)

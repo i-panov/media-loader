@@ -693,43 +693,56 @@ Redis хранится в отдельном named volume `media-loader_redis_da
 
 API по умолчанию опубликован только на `127.0.0.1:8000` и не доступен из интернета напрямую.
 
-### Multi-arch образ (`amd64` + `arm64`)
+### Публикация в `docker.ithub24.ru`
 
-`docker compose build` собирает образ только под текущую архитектуру хоста. Для переносимого
-пакета используется GitHub Actions workflow
-[.github/workflows/release.yml](.github/workflows/release.yml): по тегу `v*` или вручную он
-собирает `linux/amd64` и `linux/arm64` на нативных runners (`ubuntu-24.04` и `ubuntu-24.04-arm`,
-без QEMU) и публикует манифест в GHCR:
+`docker compose build` собирает образ только под текущую архитектуру хоста. Публикация в
+локальный registry выполняется с машины в этой сети, без GitHub Actions:
+
+```bash
+# только arm64 (текущая машина)
+TAG=0.1.0 ./scripts/publish-image.sh
+
+# multi-arch, если настроен buildx-builder с нативными узлами amd64 + arm64
+PLATFORMS=linux/amd64,linux/arm64 BUILDER=lan TAG=0.1.0 ./scripts/publish-image.sh
+```
+
+По умолчанию скрипт публикует:
 
 ```text
-ghcr.io/i-panov/media-loader:<version>
-ghcr.io/i-panov/media-loader:latest
+docker.ithub24.ru/i-panov/media-loader:<tag>
 ```
 
-Проверить архитектуры опубликованного образа:
+Если нужны отдельные сборки на разных хостах:
 
 ```bash
-docker buildx imagetools inspect ghcr.io/i-panov/media-loader:latest
+# на arm64-хосте
+TAG=0.1.0-arm64 ./scripts/publish-image.sh
+
+# на x86_64-хосте
+TAG=0.1.0-amd64 ./scripts/publish-image.sh
+
+# merge multi-arch manifest
+docker buildx imagetools create \
+  -t docker.ithub24.ru/i-panov/media-loader:0.1.0 \
+  docker.ithub24.ru/i-panov/media-loader:0.1.0-arm64 \
+  docker.ithub24.ru/i-panov/media-loader:0.1.0-amd64
 ```
 
-Локальная multi-arch сборка (без `--load`, только push в registry):
+Проверка:
 
 ```bash
-docker buildx build \
-  --platform linux/amd64,linux/arm64 \
-  -t ghcr.io/i-panov/media-loader:dev \
-  --push .
+docker buildx imagetools inspect docker.ithub24.ru/i-panov/media-loader:0.1.0
 ```
 
-Если `ubuntu-24.04-arm` недоступен (например, приватный репозиторий без arm64-runner),
-замените runner на self-hosted arm64-машину с Docker.
+Для pull снаружи локальной сети нужен `docker login docker.ithub24.ru`. Внутри LAN push
+разрешён без пароля (по настройке registry).
 
-После первого push пакет в GHCR по умолчанию приватный. Если нужен анонимный `docker pull`,
-откройте GitHub → Packages → `media-loader` → Package settings и сделайте его Public.
+GitHub Actions **не используется** для этого registry: облачные runner'ы не имеют доступа к
+локальной сети. Workflow [.github/workflows/release.yml](.github/workflows/release.yml) остаётся
+опциональным путём для GHCR, если он когда-нибудь понадобится; на `docker.ithub24.ru` он не пушит.
 
-Workflow публикует основной образ `media-loader`. `byedpi` — отдельный образ; он собирается
-из [docker/byedpi.Dockerfile](docker/byedpi.Dockerfile) и при необходимости публикуется
-аналогичным multi-arch шагом.
+`byedpi` — отдельный образ; он собирается из [docker/byedpi.Dockerfile](docker/byedpi.Dockerfile)
+и при необходимости публикуется в registry тем же способом.
 
 ### Первый деплой
 

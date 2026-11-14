@@ -14,6 +14,7 @@ from media_loader.progress import ProgressReporter
 from media_loader.ytdlp import (
     _find_media_file,
     _format_selector,
+    _result_file,
     _validate_info,
     describe_media,
     download_source,
@@ -180,6 +181,18 @@ def test_find_media_file(tmp_path: Path) -> None:
     empty.mkdir()
     with pytest.raises(DownloadError):
         _find_media_file(empty)
+
+
+def test_find_media_file_hidden_final_name(tmp_path: Path) -> None:
+    hidden = tmp_path / "._1._1 [-238771780_456251274].mkv"
+    hidden.write_bytes(b"video")
+    assert _find_media_file(tmp_path) == hidden
+
+
+def test_result_file_uses_ytdlp_filepath(tmp_path: Path) -> None:
+    hidden = tmp_path / "._1._1 [-238771780_456251274].mkv"
+    hidden.write_bytes(b"video")
+    assert _result_file({"filepath": str(hidden)}) == hidden
 
 
 def test_probe_and_download_with_fake_ytdlp(

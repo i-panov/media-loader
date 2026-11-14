@@ -4,6 +4,13 @@
 Источник истины — код и CI (`.github/workflows/ci.yml`); [README.md](README.md) — пользовательская
 документация, она может отставать от кода.
 
+## Жёсткое правило: read-only
+
+При файловой политике `read-only` запрещено изменять, создавать или удалять любые файлы,
+а также запрашивать escalation и любым способом обходить ограничение.
+Разрешены только чтение и команды, не меняющие состояние.
+Если для задачи нужна запись — остановиться и сообщить пользователю.
+
 ## Что это за проект
 
 `media-loader` — кэширующий HTTP-сервис скачивания медиа. Принимает URL, **один раз** скачивает
@@ -257,10 +264,11 @@ docker compose exec -T api media-loader-auth create --name dev --quiet
 ```
 
 - `api` публикуется только на `127.0.0.1:${API_PORT}`; наружу — через TLS reverse proxy.
-- Multi-arch release — `.github/workflows/release.yml`: `linux/amd64` + `linux/arm64` в GHCR по тегу `v*`.
-  Сборка идёт на нативных runners (`ubuntu-24.04`, `ubuntu-24.04-arm`), не через QEMU: QEMU падает
-  на `uv sync`. Не добавляйте в образ зависимости, доступные только под одну архитектуру
-  (ffmpeg ставится из apt, Deno — из wheel); `docker compose build` собирает только текущую архитектуру.
+- Публикация в `docker.ithub24.ru` — локально через [scripts/publish-image.sh](scripts/publish-image.sh)
+  (`TAG`, `PLATFORMS`, `BUILDER`); GitHub Actions не имеет доступа к LAN-registry. Multi-arch требует
+  buildx-builder с нативными узлами amd64 + arm64: QEMU падает на `uv sync`. Не добавляйте в образ
+  зависимости, доступные только под одну архитектуру (ffmpeg ставится из apt, Deno — из wheel);
+  `docker compose build` собирает только текущую архитектуру.
 - `api` ждёт healthy `redis` и запущенный `byedpi`; `worker` — один экземпляр, `stop_grace_period: 1m`.
 - `HOST_DATA_DIR` монтируется в `/data`, `./config` — read-only в `/config`. Контейнер работает от
   UID/GID 1000, каталог данных должен быть доступен этому пользователю.
