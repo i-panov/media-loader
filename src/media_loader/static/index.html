@@ -83,6 +83,7 @@
             <label id="scope-field" class="field" for="scope">
             Что скачать
             <select id="scope">
+              <option value="auto" selected>Авто</option>
               <option value="episode">Одно видео</option>
               <option value="season">Сезон</option>
               <option value="series">Все сезоны</option>
@@ -95,6 +96,29 @@
           type="submit">Загрузить</button>
         <p id="form-error" class="error" role="alert" hidden></p>
       </form>
+
+      <section id="selection-card" class="card selection-card" hidden>
+        <div class="status-head">
+          <div>
+            <p class="eyebrow">Серии</p>
+            <h2 id="selection-title">Выберите серии</h2>
+          </div>
+          <span id="selection-count" class="badge">0</span>
+        </div>
+
+        <p id="selection-meta" class="meta"></p>
+        <div id="selection-list" class="episode-list selection-list"></div>
+
+        <div class="actions">
+          <button id="selection-start" class="primary"
+            type="button">Скачать выбранные</button>
+          <button id="selection-all" class="secondary"
+            type="button">Выбрать все</button>
+          <button id="selection-cancel" class="secondary"
+            type="button">Отмена</button>
+        </div>
+        <p id="selection-error" class="error" role="alert" hidden></p>
+      </section>
 
       <section id="status-card" class="card status-card" hidden
         aria-live="polite">

@@ -8,7 +8,7 @@ import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote
 
 import redis.asyncio as aioredis
@@ -32,11 +32,12 @@ from media_loader.quality import plan_quality, quality_height
 from media_loader.schemas import (
     AUDIO_FORMATS,
     VIDEO_FORMATS,
+    CollectionScope,
     ResolvedRequest,
     VideoRequest,
     resolve_request,
 )
-from media_loader.series import resolve_collection
+from media_loader.series import CollectionSpec, detect_series_scope, resolve_collection
 from media_loader.store import Store, job_progress_key, source_progress_key
 from media_loader.utils import (
     is_within,
@@ -736,24 +737,56 @@ async def _enqueue_collection(
     return False
 
 
+def _select_episodes(
+    spec: CollectionSpec,
+    scope: str,
+    numbers: list[int] | None,
+) -> CollectionSpec:
+    if numbers is None:
+        return spec
+    if scope != "season":
+        raise HTTPException(
+            status_code=422,
+            detail="episodes selection is only supported for scope=season",
+        )
+    selected = sorted({number for number in numbers if number > 0})
+    if not selected:
+        raise HTTPException(status_code=422, detail="episodes selection must not be empty")
+    available = {episode.episode for episode in spec.episodes if episode.episode is not None}
+    missing = [number for number in selected if number not in available]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"unknown episode numbers: {', '.join(map(str, missing))}",
+        )
+    selected_set = set(selected)
+    return CollectionSpec(
+        series_id=spec.series_id,
+        title=spec.title,
+        season=spec.season,
+        episodes=tuple(episode for episode in spec.episodes if episode.episode in selected_set),
+    )
+
+
 async def _handle_collection(
     request: Request,
     payload: VideoRequest,
     resolved: ResolvedRequest,
     canonical_url: str,
+    scope: str,
 ) -> JSONResponse:
     settings: Settings = request.app.state.settings
     store: Store = request.app.state.store
     collections: CollectionStore = request.app.state.collections
     cache: SeriesCache = request.app.state.series_cache
 
-    spec = await cache.get(canonical_url, payload.scope)
+    spec = await cache.get(canonical_url, scope)
     if spec is None:
         try:
             spec = await asyncio.to_thread(
                 resolve_collection,
                 canonical_url,
-                payload.scope,
+                scope,
                 settings,
             )
         except MediaLoaderError as exc:
@@ -761,7 +794,9 @@ async def _handle_collection(
         except Exception as exc:
             LOGGER.exception("series resolution failed")
             raise HTTPException(status_code=502, detail="failed to resolve series") from exc
-        await cache.set(canonical_url, payload.scope, spec)
+        await cache.set(canonical_url, scope, spec)
+
+    spec = _select_episodes(spec, scope, payload.episodes)
 
     limit = settings.max_collection_episodes
     if limit and len(spec.episodes) > limit:
@@ -779,7 +814,7 @@ async def _handle_collection(
                 "status": "ok",
                 "metadata_only": True,
                 "collection": True,
-                "scope": payload.scope,
+                "scope": scope,
                 "series": {"id": spec.series_id, "title": spec.title},
                 "season": spec.season,
                 "seasons": sorted(
@@ -804,11 +839,14 @@ async def _handle_collection(
 
     key = collection_key(
         spec.series_id,
-        payload.scope,
+        scope,
         spec.season,
         resolved.media_type,
         resolved.output_format,
         resolved.quality,
+        tuple(episode.episode for episode in spec.episodes if episode.episode is not None)
+        if payload.episodes is not None
+        else None,
     )
     collection = await collections.get(key)
     if collection is not None:
@@ -854,7 +892,7 @@ async def _handle_collection(
                 headers={"Retry-After": str(settings.retry_after_seconds)},
             )
 
-    record = _new_collection_record(key, payload.scope, spec, resolved, canonical_url)
+    record = _new_collection_record(key, scope, spec, resolved, canonical_url)
     created = await collections.create_nx(record)
     if not created:
         existing = await collections.get(key)
@@ -1083,8 +1121,31 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-        if payload.scope != "episode":
-            return await _handle_collection(request, payload, resolved, canonical_url)
+        scope = payload.scope
+        if scope == "auto":
+            try:
+                detected = await asyncio.to_thread(
+                    detect_series_scope,
+                    canonical_url,
+                    app_settings,
+                )
+                scope = cast(CollectionScope, detected)
+            except Exception:
+                LOGGER.debug("auto series detection failed", exc_info=True)
+                scope = "episode"
+        if payload.episodes is not None and scope != "season":
+            raise HTTPException(
+                status_code=422,
+                detail="episodes selection requires scope=season",
+            )
+        if scope != "episode":
+            return await _handle_collection(
+                request,
+                payload,
+                resolved,
+                canonical_url,
+                scope,
+            )
 
         key = source_key(canonical_url)
         job_key = request_key(

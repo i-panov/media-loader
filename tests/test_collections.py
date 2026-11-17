@@ -388,6 +388,149 @@ async def test_api_collection_returns_manifest_with_episodes(
         await redis.aclose()
 
 
+def test_collection_key_depends_on_selected_episodes() -> None:
+    full = collection_key("series", "season", 1, "video", "mp4", "720p")
+    selected = collection_key(
+        "series",
+        "season",
+        1,
+        "video",
+        "mp4",
+        "720p",
+        episodes=(1, 3),
+    )
+    assert full != selected
+    assert selected == collection_key(
+        "series",
+        "season",
+        1,
+        "video",
+        "mp4",
+        "720p",
+        episodes=(3, 1),
+    )
+
+
+async def test_api_collection_filters_selected_episodes(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(api, "resolve_collection", lambda *args: _spec(4))
+    redis: Any = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    arq = FakeArq()
+    app, client = await _api_client(settings, redis, arq)
+    try:
+        async with app.router.lifespan_context(app):
+            response = await client.post(
+                "/videos",
+                json={
+                    "url": "https://example.com/series",
+                    "scope": "season",
+                    "episodes": [2, 4],
+                    "metadata_only": True,
+                },
+            )
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["episodes_total"] == 2
+            assert [episode["episode"] for episode in payload["episodes"]] == [2, 4]
+            assert arq.calls == []
+    finally:
+        await client.aclose()
+        await redis.aclose()
+
+
+async def test_api_collection_rejects_unknown_episode(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(api, "resolve_collection", lambda *args: _spec(2))
+    redis: Any = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    arq = FakeArq()
+    app, client = await _api_client(settings, redis, arq)
+    try:
+        async with app.router.lifespan_context(app):
+            response = await client.post(
+                "/videos",
+                json={
+                    "url": "https://example.com/series",
+                    "scope": "season",
+                    "episodes": [99],
+                },
+            )
+            assert response.status_code == 422
+            assert "unknown episode" in response.json()["detail"]
+            assert arq.calls == []
+    finally:
+        await client.aclose()
+        await redis.aclose()
+
+
+async def test_api_collection_rejects_bad_episode_selection(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(api, "resolve_collection", lambda *args: _spec(2))
+    redis: Any = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    arq = FakeArq()
+    app, client = await _api_client(settings, redis, arq)
+    try:
+        async with app.router.lifespan_context(app):
+            empty = await client.post(
+                "/videos",
+                json={
+                    "url": "https://example.com/series",
+                    "scope": "season",
+                    "episodes": [],
+                },
+            )
+            assert empty.status_code == 422
+            assert "must not be empty" in empty.json()["detail"]
+
+            series = await client.post(
+                "/videos",
+                json={
+                    "url": "https://example.com/series",
+                    "scope": "series",
+                    "episodes": [1],
+                },
+            )
+            assert series.status_code == 422
+            assert "scope=season" in series.json()["detail"]
+    finally:
+        await client.aclose()
+        await redis.aclose()
+
+
+async def test_api_auto_scope_uses_detected_season(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(api, "detect_series_scope", lambda *args: "season")
+    monkeypatch.setattr(api, "resolve_collection", lambda *args: _spec(2))
+    redis: Any = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    arq = FakeArq()
+    app, client = await _api_client(settings, redis, arq)
+    try:
+        async with app.router.lifespan_context(app):
+            response = await client.post(
+                "/videos",
+                json={
+                    "url": "https://example.com/series",
+                    "scope": "auto",
+                    "metadata_only": True,
+                },
+            )
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["collection"] is True
+            assert payload["scope"] == "season"
+            assert payload["episodes_total"] == 2
+    finally:
+        await client.aclose()
+        await redis.aclose()
+
+
 async def test_api_collection_metadata_only_does_not_enqueue(
     settings: Settings,
     monkeypatch: pytest.MonkeyPatch,

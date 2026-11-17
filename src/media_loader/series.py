@@ -142,6 +142,50 @@ def resolve_collection(url: str, scope: str, settings: Settings) -> CollectionSp
     return _resolve_generic(canonical_url, scope, settings)
 
 
+def detect_series_scope(url: str, settings: Settings) -> str:
+    """Return "season" for an obvious series episode/page, otherwise "episode".
+
+    This is a cheap check used by scope=auto; it does not enumerate episodes.
+    """
+    canonical_url = canonicalize_url(url)
+    host = (urlsplit(canonical_url).hostname or "").lower()
+
+    if host in _VK_HOSTS:
+        if _VK_PLAYLIST_RE.match(canonical_url):
+            return "season"
+        video_match = _VK_VIDEO_RE.match(canonical_url)
+        if video_match:
+            with httpx.Client(timeout=settings.series_timeout) as client:
+                title = _vk_video_title(
+                    client,
+                    video_match.group("owner"),
+                    video_match.group("video"),
+                )
+            if _parse_vk_episode_title(title) is not None:
+                return "season"
+        return "episode"
+
+    if host in _RUTUBE_HOSTS:
+        if _RUTUBE_TV_RE.match(canonical_url) or _RUTUBE_PLAYLIST_RE.match(canonical_url):
+            return "season"
+        video_match = _RUTUBE_VIDEO_RE.match(canonical_url)
+        if video_match:
+            video_id = video_match.group("id")
+            with httpx.Client(
+                timeout=settings.series_timeout,
+                follow_redirects=True,
+                headers=_RUTUBE_HEADERS,
+            ) as client:
+                video = _get_json(client, f"{_RUTUBE_API}/video/{video_id}/?format=json")
+            if _int_or_none(video.get("tv_show_id")) is not None:
+                return "season"
+            if _parse_episode_title(str(video.get("title") or "")) is not None:
+                return "season"
+        return "episode"
+
+    return "episode"
+
+
 def _resolve_rutube_video(url: str, scope: str, settings: Settings) -> CollectionSpec:
     match = _RUTUBE_VIDEO_RE.match(url)
     if match is None:

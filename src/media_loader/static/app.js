@@ -24,6 +24,15 @@ const el = {
   qualityField: document.querySelector("#quality-field"),
   scope: document.querySelector("#scope"),
   episodeList: document.querySelector("#episode-list"),
+  selectionCard: document.querySelector("#selection-card"),
+  selectionTitle: document.querySelector("#selection-title"),
+  selectionCount: document.querySelector("#selection-count"),
+  selectionMeta: document.querySelector("#selection-meta"),
+  selectionList: document.querySelector("#selection-list"),
+  selectionStart: document.querySelector("#selection-start"),
+  selectionAll: document.querySelector("#selection-all"),
+  selectionCancel: document.querySelector("#selection-cancel"),
+  selectionError: document.querySelector("#selection-error"),
   startButton: document.querySelector("#start-button"),
   formError: document.querySelector("#form-error"),
   statusCard: document.querySelector("#status-card"),
@@ -51,6 +60,7 @@ const state = {
   timer: null,
   running: false,
   request: null,
+  preview: null,
   errors: 0,
 };
 
@@ -180,10 +190,10 @@ function applyLocation() {
   const params = new URLSearchParams(location.search);
   const url = params.get("url") || "";
   const rawFormat = (params.get("format") || "").toLowerCase();
-  const scope = params.get("scope") || "episode";
-  el.scope.value = ["episode", "season", "series"].includes(scope)
+  const scope = params.get("scope") || "auto";
+  el.scope.value = ["auto", "episode", "season", "series"].includes(scope)
     ? scope
-    : "episode";
+    : "auto";
   const audio = ["1", "true", "yes"].includes(
     (params.get("audio_only") || "").toLowerCase(),
   ) || isAudioFormat(rawFormat);
@@ -451,7 +461,126 @@ function renderEpisodes(episodes) {
   }
 }
 
+function hideSelection() {
+  el.selectionCard.hidden = true;
+  el.selectionError.hidden = true;
+  el.selectionError.textContent = "";
+}
+
+function selectionBoxes() {
+  return [...el.selectionList.querySelectorAll("input[type=checkbox]")];
+}
+
+function updateSelectionCount() {
+  const boxes = selectionBoxes();
+  const checked = boxes.filter((box) => box.checked).length;
+  el.selectionCount.textContent = `${checked}/${boxes.length}`;
+  el.selectionStart.disabled = checked === 0;
+  el.selectionAll.textContent = checked === boxes.length
+    ? "Снять все"
+    : "Выбрать все";
+}
+
+function renderSelection() {
+  const data = state.preview.data;
+  el.selectionCard.hidden = false;
+  el.selectionTitle.textContent = data.series?.title || "Серии";
+  const meta = [];
+  if (data.season) {
+    meta.push(`Сезон ${data.season}`);
+  } else if ((data.seasons || []).length > 1) {
+    meta.push(`Сезонов: ${data.seasons.length}`);
+  }
+  if (data.episodes_total) {
+    meta.push(`${data.episodes_total} серий`);
+  }
+  if (data.format) {
+    meta.push(String(data.format).toUpperCase());
+  }
+  if (data.quality) {
+    meta.push(String(data.quality));
+  }
+  el.selectionMeta.textContent = meta.join(" · ");
+  el.selectionList.replaceChildren();
+
+  let currentSeason = null;
+  for (const episode of data.episodes || []) {
+    if (
+      typeof episode.season === "number" && episode.season !== currentSeason
+    ) {
+      currentSeason = episode.season;
+      const heading = document.createElement("p");
+      heading.className = "episode-season";
+      heading.textContent = `Сезон ${currentSeason}`;
+      el.selectionList.append(heading);
+    }
+    const row = document.createElement("label");
+    row.className = "episode selection-episode";
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.className = "episode-check";
+    check.checked = true;
+    check.value = String(episode.episode);
+    check.addEventListener("change", updateSelectionCount);
+    const number = document.createElement("span");
+    number.className = "episode-number";
+    number.textContent = episodeLabel(episode.season, episode.episode);
+    const title = document.createElement("span");
+    title.className = "episode-title";
+    title.textContent = episode.title || "Серия";
+    title.title = title.textContent;
+    row.append(check, number, title);
+    el.selectionList.append(row);
+  }
+  el.selectionError.hidden = true;
+  el.selectionError.textContent = "";
+  updateSelectionCount();
+}
+
+function selectionError(message) {
+  el.selectionError.textContent = message;
+  el.selectionError.hidden = !message;
+}
+
+function startSelectedEpisodes() {
+  if (!state.preview) {
+    return;
+  }
+  const boxes = selectionBoxes();
+  const selected = boxes
+    .filter((box) => box.checked)
+    .map((box) => Number.parseInt(box.value, 10))
+    .filter((value) => Number.isInteger(value) && value > 0)
+    .sort((left, right) => left - right);
+  if (!selected.length) {
+    selectionError("Выберите хотя бы одну серию.");
+    return;
+  }
+  const params = new URLSearchParams(state.preview.params.toString());
+  params.set("scope", "season");
+  if (selected.length < boxes.length) {
+    params.set("episodes", selected.join(","));
+  } else {
+    params.delete("episodes");
+  }
+  hideSelection();
+  state.preview = null;
+  writeLocation(params);
+  startRequest(params);
+}
+
+function toggleAllEpisodes() {
+  const boxes = selectionBoxes();
+  const allChecked = boxes.length > 0 && boxes.every((box) => box.checked);
+  for (const box of boxes) {
+    box.checked = !allChecked;
+  }
+  updateSelectionCount();
+}
+
 function renderReady(data) {
+  hideSelection();
+  state.preview = null;
   if (Array.isArray(data.episodes)) {
     renderCollection(data);
     return;
@@ -475,6 +604,8 @@ function renderReady(data) {
 }
 
 function renderError(message) {
+  hideSelection();
+  state.preview = null;
   el.statusCard.hidden = false;
   el.statusCard.dataset.status = "failed";
   el.statusLabel.textContent = "Ошибка";
@@ -522,6 +653,30 @@ async function parseJson(response) {
   }
 }
 
+function parseEpisodes(params) {
+  const numbers = (params.get("episodes") || "")
+    .split(",")
+    .map((value) => Number.parseInt(value, 10))
+    .filter((value) => Number.isInteger(value) && value > 0);
+  return numbers.length
+    ? [...new Set(numbers)].sort((left, right) => left - right)
+    : null;
+}
+
+function bodyFromParams(params, metadataOnly) {
+  const audioOnly = params.get("audio_only") === "1";
+  return {
+    url: params.get("url") || "",
+    audio_only: audioOnly,
+    format: params.get("format") || undefined,
+    quality: audioOnly ? null : (params.get("quality") || null),
+    scope: params.get("scope") || "auto",
+    episodes: parseEpisodes(params),
+    metadata_only: metadataOnly,
+    respond_json: false,
+  };
+}
+
 function handleAuthError() {
   stopPolling();
   setBusy(false);
@@ -548,6 +703,7 @@ async function poll() {
         format: state.request.format,
         quality: state.request.audioOnly ? null : state.request.quality || null,
         scope: state.request.scope,
+        episodes: state.request.episodes,
         respond_json: true,
       }),
       signal: controller.signal,
@@ -607,15 +763,17 @@ function startRequest(params) {
     : (state.config.video_formats.includes(rawFormat)
       ? rawFormat
       : state.config.default_video_format);
-  const scope = ["episode", "season", "series"].includes(params.get("scope"))
-    ? params.get("scope")
-    : "episode";
+  const scope =
+    ["auto", "episode", "season", "series"].includes(params.get("scope"))
+      ? params.get("scope")
+      : "auto";
   state.request = {
     url: params.get("url") || "",
     audioOnly,
     format,
     quality: audioOnly ? "" : (params.get("quality") || ""),
     scope,
+    episodes: parseEpisodes(params),
   };
   state.running = true;
   state.errors = 0;
@@ -645,6 +803,90 @@ function validUrl(value) {
   }
 }
 
+function formatServerDetail(data, status) {
+  if (typeof data.detail === "string") {
+    return data.detail;
+  }
+  if (Array.isArray(data.detail)) {
+    return data.detail.map((item) => item.msg || String(item)).join("; ");
+  }
+  return data.error || `HTTP ${status}`;
+}
+
+async function previewEpisodes(params) {
+  stopPolling();
+  hideSelection();
+  state.preview = null;
+  showFormError("");
+  setBusy(true);
+  el.statusCard.hidden = false;
+  el.statusCard.dataset.status = "processing";
+  el.statusLabel.textContent = "Проверка серий";
+  el.statusBadge.textContent = "…";
+  el.mediaTitle.textContent = "Ищем серии";
+  el.mediaMeta.hidden = true;
+  el.progress.removeAttribute("value");
+  el.progressText.textContent = "";
+  el.startedAt.textContent = "";
+  el.statusDetail.textContent = "Определяем сезон и список серий…";
+  el.downloadLink.hidden = true;
+  el.episodeList.hidden = true;
+  el.episodeList.replaceChildren();
+
+  try {
+    const response = await fetch("/videos", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeaders(),
+      },
+      body: JSON.stringify(bodyFromParams(params, true)),
+    });
+    if (response.status === 401) {
+      handleAuthError();
+      return;
+    }
+    const data = await parseJson(response);
+    if (response.status === 200 && Array.isArray(data.episodes)) {
+      state.preview = { params, data };
+      setBusy(false);
+      el.statusCard.hidden = true;
+      renderSelection();
+      return;
+    }
+    if (response.status === 200 && (params.get("scope") || "") === "auto") {
+      const next = new URLSearchParams(params.toString());
+      next.set("scope", "episode");
+      writeLocation(next);
+      startRequest(next);
+      return;
+    }
+    if (response.status === 422 && (params.get("scope") || "") === "auto") {
+      const next = new URLSearchParams(params.toString());
+      next.set("scope", "episode");
+      writeLocation(next);
+      startRequest(next);
+      return;
+    }
+    setBusy(false);
+    renderError(formatServerDetail(data, response.status));
+  } catch {
+    setBusy(false);
+    renderError(
+      "Не удалось проверить список серий. Проверьте сеть и повторите.",
+    );
+  }
+}
+
+function startOrPreview(params) {
+  const scope = params.get("scope") || "auto";
+  if ((scope === "auto" || scope === "season") && !parseEpisodes(params)) {
+    previewEpisodes(params);
+    return;
+  }
+  startRequest(params);
+}
+
 function handleSubmit(event) {
   event.preventDefault();
   showFormError("");
@@ -660,11 +902,13 @@ function handleSubmit(event) {
   }
   const params = paramsFromForm();
   writeLocation(params);
-  startRequest(params);
+  startOrPreview(params);
 }
 
 function resetView() {
   stopPolling();
+  hideSelection();
+  state.preview = null;
   setBusy(false);
   el.statusCard.hidden = true;
   el.downloadLink.hidden = true;
@@ -702,7 +946,7 @@ async function init() {
     showFormError("");
     const currentUrl = new URLSearchParams(location.search).get("url") || "";
     if (currentUrl && !state.running) {
-      startRequest(new URLSearchParams(location.search));
+      startOrPreview(new URLSearchParams(location.search));
     }
   });
   el.tokenClear.addEventListener("click", () => {
@@ -712,6 +956,14 @@ async function init() {
   });
   el.form.addEventListener("submit", handleSubmit);
   el.resetButton.addEventListener("click", resetView);
+  el.selectionStart.addEventListener("click", startSelectedEpisodes);
+  el.selectionAll.addEventListener("click", toggleAllEpisodes);
+  el.selectionCancel.addEventListener("click", () => {
+    hideSelection();
+    state.preview = null;
+    el.statusCard.hidden = true;
+    setBusy(false);
+  });
   el.modeVideo.addEventListener("change", syncMode);
   el.modeAudio.addEventListener("change", syncMode);
   addEventListener("popstate", () => {
@@ -719,7 +971,7 @@ async function init() {
     setBusy(false);
     const nextUrl = applyLocation();
     if (nextUrl) {
-      startRequest(new URLSearchParams(location.search));
+      startOrPreview(new URLSearchParams(location.search));
     } else {
       el.statusCard.hidden = true;
       el.downloadLink.hidden = true;
@@ -728,7 +980,7 @@ async function init() {
   if (initialUrl) {
     el.options.open = false;
     if (!state.config.auth_required || state.token) {
-      startRequest(new URLSearchParams(location.search));
+      startOrPreview(new URLSearchParams(location.search));
     } else {
       setTokenPanel(true);
       showFormError("Сохраните API-токен, чтобы начать загрузку.");

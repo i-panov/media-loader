@@ -102,6 +102,40 @@ def test_spec_roundtrip_keeps_order() -> None:
     assert restored.episodes[1].episode == 2
 
 
+def test_vk_auto_detects_episode_title(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(series.httpx, "Client", lambda **kwargs: _FakeClient({}))  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        series,
+        "_vk_video_title",
+        lambda *args: "Полуночный мотив сердца. Сезон 1. Серия 2",
+    )
+    assert (
+        series.detect_series_scope(
+            "https://vkvideo.ru/video-238771780_456240685",
+            settings,
+        )
+        == "season"
+    )
+
+
+def test_vk_auto_keeps_standalone_video(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(series.httpx, "Client", lambda **kwargs: _FakeClient({}))  # type: ignore[attr-defined]
+    monkeypatch.setattr(series, "_vk_video_title", lambda *args: "Обычный ролик")
+    assert (
+        series.detect_series_scope(
+            "https://vkvideo.ru/video-238771780_456240685",
+            settings,
+        )
+        == "episode"
+    )
+
+
 def test_rutube_season_resolution(
     settings: Settings,
     monkeypatch: pytest.MonkeyPatch,

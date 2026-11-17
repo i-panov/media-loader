@@ -23,11 +23,14 @@ def collection_key(
     media_type: str,
     output_format: str,
     quality: str | None,
+    episodes: tuple[int, ...] | None = None,
 ) -> str:
     material = (
         f"{series_id}|{scope}|{season if season is not None else ''}|"
         f"{media_type}:{output_format}|{quality or MAX_FORMAT}"
     )
+    if episodes:
+        material += "|episodes:" + ",".join(str(number) for number in sorted(set(episodes)))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 

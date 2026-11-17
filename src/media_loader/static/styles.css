@@ -489,6 +489,24 @@ progress::-moz-progress-bar {
   border-radius: var(--radius-small);
 }
 
+.selection-card {
+  display: grid;
+  gap: 13px;
+}
+
+.selection-episode {
+  cursor: pointer;
+}
+
+.episode-check {
+  flex: 0 0 auto;
+  width: 18px;
+  min-height: 18px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--accent);
+}
+
 .episode-number {
   flex: 0 0 auto;
   color: var(--muted);
