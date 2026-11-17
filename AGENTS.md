@@ -287,7 +287,7 @@ docker compose exec -T api media-loader-auth create --name dev --quiet
   fallback direct/proxy). Не превращайте его в job и не блокируйте event loop.
 - `scope` по умолчанию — `episode`; не меняйте это без миграции клиентов. UI использует `auto`.
   Для коллекции `200` всегда JSON-манифест, а не файл. `episodes` допустим только для `season`
-  и входит в `collection_key`; не теряйте его при polling.
+  и входит в `collection_key`; для `series` он даёт `422`. Не теряйте его при polling.
 - Универсально «любая ссылка на серию» не работает: yt-dlp не выводит родителя из одиночного видео.
   RuTube-адаптер закрывает нативные сериалы; playlist-серии требуют `?pl_id`/страницу плейлиста;
   канальные загрузки — через TV-сущность (`metainfo/tv?search=`) или, если её нет, по заголовку
